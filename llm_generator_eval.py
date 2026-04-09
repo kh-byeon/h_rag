@@ -1,7 +1,7 @@
 """
 검색된 Top-K 문서를 활용한 LLM 생성(Generation) 및 양자화(INT8/INT4) 수준별 성능 평가.
-`online_accelerator`가 내보낸 JSON(l2_contexts / mmr_contexts)을 읽어 로컬 LLM으로 답변 생성 후,
-Semantic Similarity(정답에 `[SEP]`이 있으면 조각별 max)·고유 단어 비율·NLI Faithfulness(CrossEncoder)·선택적 LLM-as-a-Judge.
+`online_accelerator`가 내보낸 JSON(b1_contexts / b2_contexts / mmr_contexts)을 읽어 로컬 LLM으로 답변 생성 후,
+Semantic Similarity(정답에 `[SEP]`이 있으면 조각별 max)·고유 단어 비율·Answer Coverage(Token Recall)·선택적 LLM-as-a-Judge.
 생성 프롬프트는 계약 발췌 우선·질문 말미 배치(Lost in the Middle 완화).
 
 `sweep_eval.py`가 저장한 `run_manifest.json` 또는 `retrieval_*.jsonl`을 읽어 파라미터 조합별로
@@ -27,9 +27,6 @@ import re
 import sys
 from string import Template
 from typing import Any, Dict, List, Optional, Tuple
-
-from sentence_transformers import CrossEncoder
-
 
 def _calc_unique_token_ratio(text: str) -> float:
     """생성 텍스트의 유니그램 기준 고유 단어 비율 |V|/N (다양성 휴리스틱)."""
@@ -64,12 +61,13 @@ def build_generation_prompt(query: str, contexts: List[str]) -> str:
     )
 
 
-# ----- 심판 LLM용 프롬프트 ($query / $answer_l2 / $answer_mmr 는 Template 치환) -----
+# ----- 심판 LLM용 프롬프트 ($query / $answer_b1 / $answer_b2 / $answer_mmr 는 Template 치환) -----
 JUDGE_PROMPT_TEMPLATE = Template(
     """당신은 법률 계약서(CUAD) QA 시스템의 성능을 평가하는 심판입니다.
 [Question]: $query
-[Answer A (L2 RAG)]: $answer_l2
-[Answer B (MMR RAG)]: $answer_mmr
+[Answer A (B1: Single-query Pure L2)]: $answer_b1
+[Answer B (B2: Sequential Multi-query Pure L2)]: $answer_b2
+[Answer C (MMR: Sequential Multi-query Smart Acceleration)]: $answer_mmr
 
 아래 3가지 항목을 1~5점으로 평가하고 승자를 가려주세요.
 1. Comprehensiveness (포괄성 및 정보 밀도)
@@ -77,7 +75,7 @@ JUDGE_PROMPT_TEMPLATE = Template(
 3. Faithfulness (근거 충실도)
 
 반드시 아래 JSON 형식으로만 응답하세요:
-{"winner": "A|B|TIE", "reason": "...", "scores": {"Answer_A": {"comprehensiveness": 0, "conciseness": 0, "faithfulness": 0}, "Answer_B": {"comprehensiveness": 0, "conciseness": 0, "faithfulness": 0}}}
+{"winner": "A|B|C|TIE", "reason": "...", "scores": {"Answer_A": {"comprehensiveness": 0, "conciseness": 0, "faithfulness": 0}, "Answer_B": {"comprehensiveness": 0, "conciseness": 0, "faithfulness": 0}, "Answer_C": {"comprehensiveness": 0, "conciseness": 0, "faithfulness": 0}}}
 """
 )
 
@@ -87,11 +85,14 @@ def _template_escape(s: str) -> str:
     return (s or "").replace("$", "$$")
 
 
-def build_judge_prompt_text(query: str, answer_l2: str, answer_mmr: str) -> str:
+def build_judge_prompt_text(
+    query: str, answer_b1: str, answer_b2: str, answer_mmr: str
+) -> str:
     """JUDGE_PROMPT_TEMPLATE 을 채운 단일 사용자 프롬프트 문자열."""
     return JUDGE_PROMPT_TEMPLATE.substitute(
         query=_template_escape(query),
-        answer_l2=_template_escape(answer_l2),
+        answer_b1=_template_escape(answer_b1),
+        answer_b2=_template_escape(answer_b2),
         answer_mmr=_template_escape(answer_mmr),
     )
 
@@ -116,7 +117,8 @@ def parse_judge_json(raw: str) -> Dict[str, Any]:
 
 def evaluate_with_llm_judge(
     query: str,
-    answer_l2: str,
+    answer_b1: str,
+    answer_b2: str,
     answer_mmr: str,
     *,
     provider: str = "openai",
@@ -127,7 +129,7 @@ def evaluate_with_llm_judge(
     OpenAI 또는 Google Gemini API로 LLM-as-a-Judge 평가.
     API 키: OPENAI_API_KEY / GOOGLE_API_KEY 또는 GEMINI_API_KEY (os.getenv).
     """
-    prompt = build_judge_prompt_text(query, answer_l2, answer_mmr)
+    prompt = build_judge_prompt_text(query, answer_b1, answer_b2, answer_mmr)
     raw = ""
     provider = (provider or "openai").lower().strip()
 
@@ -225,10 +227,11 @@ def run_llm_as_judge(
     query: str,
     answer_a: str,
     answer_b: str,
+    answer_c: str,
     max_new_tokens: int = 512,
 ) -> Dict[str, Any]:
-    """로컬 transformers 모델로 심판 (Answer A=L2, B=MMR)."""
-    prompt = build_judge_prompt_text(query, answer_a, answer_b)
+    """로컬 transformers 모델로 심판 (Answer A=B1, B=B2, C=MMR)."""
+    prompt = build_judge_prompt_text(query, answer_a, answer_b, answer_c)
     import torch
 
     if hasattr(tokenizer, "apply_chat_template"):
@@ -280,14 +283,15 @@ def run_llm_as_judge(
 
 
 def aggregate_judge_stats(judge_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """winner 집계(A=L2, B=MMR) 및 평균 점수 요약."""
+    """winner 집계(A=B1, B=B2, C=MMR) 및 평균 점수 요약."""
     n = len(judge_results)
     if n == 0:
         return {}
 
-    wins_l2 = wins_mmr = ties = 0
+    wins_b1 = wins_b2 = wins_mmr = ties = 0
     sum_a = {"comprehensiveness": 0.0, "conciseness": 0.0, "faithfulness": 0.0}
     sum_b = {"comprehensiveness": 0.0, "conciseness": 0.0, "faithfulness": 0.0}
+    sum_c = {"comprehensiveness": 0.0, "conciseness": 0.0, "faithfulness": 0.0}
     count_scores = 0
 
     for jr in judge_results:
@@ -295,29 +299,42 @@ def aggregate_judge_stats(judge_results: List[Dict[str, Any]]) -> Dict[str, Any]
         if "|" in w:
             w = w.split("|")[0].strip()
         if w == "A":
-            wins_l2 += 1
+            wins_b1 += 1
         elif w == "B":
+            wins_b2 += 1
+        elif w == "C":
             wins_mmr += 1
         else:
             ties += 1
         scores = jr.get("scores") or {}
         sa = scores.get("Answer_A") or scores.get("answer_a") or {}
         sb = scores.get("Answer_B") or scores.get("answer_b") or {}
-        if isinstance(sa, dict) and isinstance(sb, dict) and sa and sb:
+        sc = scores.get("Answer_C") or scores.get("answer_c") or {}
+        if (
+            isinstance(sa, dict)
+            and isinstance(sb, dict)
+            and isinstance(sc, dict)
+            and sa
+            and sb
+            and sc
+        ):
             for k in sum_a:
                 try:
                     sum_a[k] += float(sa.get(k, 0) or 0)
                     sum_b[k] += float(sb.get(k, 0) or 0)
+                    sum_c[k] += float(sc.get(k, 0) or 0)
                 except (TypeError, ValueError):
                     pass
             count_scores += 1
 
     out: Dict[str, Any] = {
         "judge_n": n,
-        "judge_wins_l2": wins_l2,
+        "judge_wins_b1": wins_b1,
+        "judge_wins_b2": wins_b2,
         "judge_wins_mmr": wins_mmr,
         "judge_ties": ties,
-        "judge_win_rate_l2": wins_l2 / n,
+        "judge_win_rate_b1": wins_b1 / n,
+        "judge_win_rate_b2": wins_b2 / n,
         "judge_win_rate_mmr": wins_mmr / n,
         "judge_tie_rate": ties / n,
     }
@@ -325,6 +342,7 @@ def aggregate_judge_stats(judge_results: List[Dict[str, Any]]) -> Dict[str, Any]
         for k in sum_a:
             out[f"judge_avg_A_{k}"] = sum_a[k] / count_scores
             out[f"judge_avg_B_{k}"] = sum_b[k] / count_scores
+            out[f"judge_avg_C_{k}"] = sum_c[k] / count_scores
     return out
 
 
@@ -422,19 +440,9 @@ def retrieval_record_to_eval_item(r: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "query": r.get("query"),
         "ground_truth": r.get("ground_truth"),
-        "l2_contexts": r.get("l2_contexts"),
+        "b1_contexts": r.get("b1_contexts"),
+        "b2_contexts": r.get("b2_contexts"),
         "mmr_contexts": r.get("mmr_contexts"),
-    }
-
-
-def _faithfulness_hallucination_flags(
-    l2_faith: float, mmr_faith: float, threshold: float = 0.35
-) -> Dict[str, Any]:
-    """NLI faithfulness 기반 휴리스틱(낮으면 근거 미약·환각 가능성)."""
-    return {
-        "faithfulness_threshold": threshold,
-        "l2_possible_ungrounded": bool(l2_faith < threshold),
-        "mmr_possible_ungrounded": bool(mmr_faith < threshold),
     }
 
 
@@ -468,7 +476,8 @@ def normalize_eval_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """
     online_accelerator export 또는 변형 키를 통일.
     - query / question / prompt
-    - l2_contexts / context_l2 / l2_context (+ 문자열이면 단일 블록으로 취급)
+    - b1_contexts / context_b1 / b1_context (하위 호환: l2_contexts 계열)
+    - b2_contexts / context_b2 / b2_context
     - mmr_contexts / context_mmr / mmr_context
     """
     q = item.get("query") or item.get("question") or item.get("prompt") or ""
@@ -481,16 +490,26 @@ def normalize_eval_item(item: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(gt, str):
         gt = str(gt) if gt is not None else ""
 
-    l2 = item.get("l2_contexts") or item.get("context_l2") or item.get("l2_context")
+    b1 = (
+        item.get("b1_contexts")
+        or item.get("context_b1")
+        or item.get("b1_context")
+        or item.get("l2_contexts")
+        or item.get("context_l2")
+        or item.get("l2_context")
+    )
+    b2 = item.get("b2_contexts") or item.get("context_b2") or item.get("b2_context")
     mmr = item.get("mmr_contexts") or item.get("context_mmr") or item.get("mmr_context")
 
-    l2_list = _as_str_list(l2)
+    b1_list = _as_str_list(b1)
+    b2_list = _as_str_list(b2)
     mmr_list = _as_str_list(mmr)
 
     return {
         "query": str(q).strip(),
         "ground_truth": gt.strip(),
-        "l2_contexts": l2_list,
+        "b1_contexts": b1_list,
+        "b2_contexts": b2_list,
         "mmr_contexts": mmr_list,
     }
 
@@ -499,9 +518,13 @@ def normalize_eval_item(item: Dict[str, Any]) -> Dict[str, Any]:
 EVAL_DATA: List[Dict[str, Any]] = [
     {
         "query": "What is the main obligation of the borrower?",
-        "l2_contexts": [
+        "b1_contexts": [
             "The borrower shall repay the principal amount within 24 months.",
             "Interest rate is fixed at 5% per annum.",
+        ],
+        "b2_contexts": [
+            "The borrower shall repay the principal amount within 24 months.",
+            "Payment obligations survive early termination of this agreement.",
         ],
         "mmr_contexts": [
             "The borrower shall repay the principal amount within 24 months.",
@@ -511,9 +534,13 @@ EVAL_DATA: List[Dict[str, Any]] = [
     },
     {
         "query": "When does the contract expire?",
-        "l2_contexts": [
+        "b1_contexts": [
             "This agreement is effective from January 1, 2024.",
             "The contract shall expire on December 31, 2025.",
+        ],
+        "b2_contexts": [
+            "The contract starts on January 1, 2024 and lasts for two years.",
+            "Any renewal requires written notice 60 days before expiry.",
         ],
         "mmr_contexts": [
             "The contract shall expire on December 31, 2025.",
@@ -609,22 +636,6 @@ def semantic_similarity(text_a: str, text_b: str, encoder: Any) -> float:
         return 0.0
 
 
-def get_faithfulness_score(nli_model: Any, context: str, answer: str) -> float:
-    """NLI CrossEncoder로 Premise=문맥, Hypothesis=답변에 대한 Entailment 확률(인덱스 1)."""
-    if not answer or not context:
-        return 0.0
-    import numpy as np
-    from scipy.special import softmax
-
-    scores = nli_model.predict([(context, answer)])
-    arr = np.asarray(scores)
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    probabilities = softmax(arr, axis=1)
-    entailment_prob = float(probabilities[0][1])
-    return entailment_prob
-
-
 def split_ground_truth_sep(gt: str) -> List[str]:
     """Ground Truth를 [SEP]로 분리한 조각 리스트(공백만인 조각은 제외)."""
     raw = str(gt or "")
@@ -648,6 +659,29 @@ def max_semantic_vs_gt_pieces(
     return best
 
 
+def calc_answer_coverage(gt_pieces: List[str], answer: str) -> float:
+    """
+    각 정답 조각(GT piece)의 단어들이 생성된 답변(answer)에 얼마나 포함되었는지
+    Token Recall(포함된 단어 수 / GT 단어 수)을 계산하고, 그중 최댓값을 반환합니다.
+    """
+    if not gt_pieces or not answer:
+        return 0.0
+    ans_tokens = set(re.findall(r"\w+", str(answer).lower()))
+    if not ans_tokens:
+        return 0.0
+
+    best_cov = 0.0
+    for p in gt_pieces:
+        gt_toks = re.findall(r"\w+", str(p).lower())
+        if not gt_toks:
+            continue
+        matched = sum(1 for w in gt_toks if w in ans_tokens)
+        cov = matched / len(gt_toks)
+        if cov > best_cov:
+            best_cov = cov
+    return best_cov
+
+
 def _flatten_judge_scores(jr: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "judge_winner": jr.get("winner", ""),
@@ -658,9 +692,11 @@ def _flatten_judge_scores(jr: Dict[str, Any]) -> Dict[str, Any]:
     sc = jr.get("scores") or {}
     sa = sc.get("Answer_A") or sc.get("answer_a") or {}
     sb = sc.get("Answer_B") or sc.get("answer_b") or {}
+    sc3 = sc.get("Answer_C") or sc.get("answer_c") or {}
     for k in ("comprehensiveness", "conciseness", "faithfulness"):
         out[f"A_{k}"] = sa.get(k, "") if isinstance(sa, dict) else ""
         out[f"B_{k}"] = sb.get(k, "") if isinstance(sb, dict) else ""
+        out[f"C_{k}"] = sc3.get(k, "") if isinstance(sc3, dict) else ""
     return out
 
 
@@ -693,12 +729,15 @@ SWEEP_CONFIGS: List[Dict[str, str]] = [
 def extract_sweep_summary_metrics(report: Dict[str, Any]) -> Dict[str, float]:
     """sweep_summary.json에 넣을 핵심 지표."""
     return {
-        "l2_semantic_avg": float(report.get("l2_semantic_avg", 0.0)),
+        "b1_semantic_avg": float(report.get("b1_semantic_avg", 0.0)),
+        "b2_semantic_avg": float(report.get("b2_semantic_avg", 0.0)),
         "mmr_semantic_avg": float(report.get("mmr_semantic_avg", 0.0)),
-        "l2_unique_ratio_avg": float(report.get("l2_unique_ratio_avg", 0.0)),
+        "b1_unique_ratio_avg": float(report.get("b1_unique_ratio_avg", 0.0)),
+        "b2_unique_ratio_avg": float(report.get("b2_unique_ratio_avg", 0.0)),
         "mmr_unique_ratio_avg": float(report.get("mmr_unique_ratio_avg", 0.0)),
-        "l2_faithfulness_avg": float(report.get("l2_faithfulness_avg", 0.0)),
-        "mmr_faithfulness_avg": float(report.get("mmr_faithfulness_avg", 0.0)),
+        "b1_answer_coverage_avg": float(report.get("b1_coverage_avg", 0.0)),
+        "b2_answer_coverage_avg": float(report.get("b2_coverage_avg", 0.0)),
+        "mmr_answer_coverage_avg": float(report.get("mmr_coverage_avg", 0.0)),
     }
 
 
@@ -706,10 +745,9 @@ def cleanup_generation_gpu_memory(
     model: Any,
     tokenizer: Any,
     semantic_encoder: Any,
-    nli_model: Any = None,
 ) -> None:
-    """스윕 반복마다 모델·토크나이저·임베더·NLI를 해제하고 CUDA 캐시를 비운다."""
-    for obj in (model, tokenizer, semantic_encoder, nli_model):
+    """스윕 반복마다 모델·토크나이저·임베더를 해제하고 CUDA 캐시를 비운다."""
+    for obj in (model, tokenizer, semantic_encoder):
         if obj is not None:
             del obj
     gc.collect()
@@ -722,7 +760,7 @@ def cleanup_generation_gpu_memory(
         pass
 
 
-PreloadedModels = Tuple[Any, Any, Any, Any]
+PreloadedModels = Tuple[Any, Any, Any]
 
 
 def run_eval(
@@ -742,17 +780,17 @@ def run_eval(
     include_prompts: bool = False,
 ) -> Any:
     """
-    eval_data 순회: l2_contexts → answer_l2, mmr_contexts → answer_mmr 생성.
+    eval_data 순회: b1_contexts/b2_contexts/mmr_contexts 각각으로 답변 생성.
     Ground Truth에 [SEP]가 있으면 조각별 Semantic 유사도의 max를 쿼리 점수로 사용.
-    Semantic / Unique Token Ratio / NLI Faithfulness 유지. run_judge 시 API 또는 local 심판.
-    preloaded=(model, tokenizer, semantic_encoder, nli_model)이면 로드 생략(스윕 검색 조합 연속 평가용).
+    Semantic / Unique Token Ratio / Answer Coverage 유지. run_judge 시 API 또는 local 심판.
+    preloaded=(model, tokenizer, semantic_encoder)이면 로드 생략(스윕 검색 조합 연속 평가용).
     include_prompts=True이면 per_query_details에 전체 프롬프트 문자열 포함.
     return_model_for_cleanup=True 이면
-    (report, csv_rows, per_query_details, model, tokenizer, semantic_encoder, nli_model) 반환.
+    (report, csv_rows, per_query_details, model, tokenizer, semantic_encoder) 반환.
     그렇지 않으면 (report, csv_rows, per_query_details) 반환.
     """
     if preloaded is not None:
-        model, tokenizer, semantic_encoder, nli_model = preloaded
+        model, tokenizer, semantic_encoder = preloaded
     else:
         model, tokenizer = load_llm(model_name, quantization)
 
@@ -760,15 +798,15 @@ def run_eval(
 
         semantic_encoder = SentenceTransformer(semantic_model)
 
-        print("[로드] NLI 모델 (Faithfulness 평가용) 불러오는 중...", flush=True)
-        nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-base")
-
-    l2_semantic: List[float] = []
+    b1_semantic: List[float] = []
+    b2_semantic: List[float] = []
     mmr_semantic: List[float] = []
-    l2_unique_list: List[float] = []
+    b1_unique_list: List[float] = []
+    b2_unique_list: List[float] = []
     mmr_unique_list: List[float] = []
-    l2_faith_list: List[float] = []
-    mmr_faith_list: List[float] = []
+    b1_coverage_list: List[float] = []
+    b2_coverage_list: List[float] = []
+    mmr_coverage_list: List[float] = []
     judge_rows: List[Dict[str, Any]] = []
     csv_rows: List[Dict[str, Any]] = []
     per_query_details: List[Dict[str, Any]] = []
@@ -779,44 +817,57 @@ def run_eval(
         item = normalize_eval_item(raw_item)
         query = item["query"]
         gt = item["ground_truth"]
-        l2_ctx = item["l2_contexts"]
+        b1_ctx = item["b1_contexts"]
+        b2_ctx = item["b2_contexts"]
         mmr_ctx = item["mmr_contexts"]
 
-        answer_l2 = generate_answer(
-            model, tokenizer, query, l2_ctx, max_new_tokens=max_new_tokens
+        answer_b1 = generate_answer(
+            model, tokenizer, query, b1_ctx, max_new_tokens=max_new_tokens
+        )
+        answer_b2 = generate_answer(
+            model, tokenizer, query, b2_ctx, max_new_tokens=max_new_tokens
         )
         answer_mmr = generate_answer(
             model, tokenizer, query, mmr_ctx, max_new_tokens=max_new_tokens
         )
 
         gt_pieces = split_ground_truth_sep(gt)
-        s_l2 = max_semantic_vs_gt_pieces(gt_pieces, answer_l2, semantic_encoder)
+        s_b1 = max_semantic_vs_gt_pieces(gt_pieces, answer_b1, semantic_encoder)
+        s_b2 = max_semantic_vs_gt_pieces(gt_pieces, answer_b2, semantic_encoder)
         s_mmr = max_semantic_vs_gt_pieces(gt_pieces, answer_mmr, semantic_encoder)
-        l2_unique_ratio = _calc_unique_token_ratio(answer_l2)
+        b1_unique_ratio = _calc_unique_token_ratio(answer_b1)
+        b2_unique_ratio = _calc_unique_token_ratio(answer_b2)
         mmr_unique_ratio = _calc_unique_token_ratio(answer_mmr)
 
-        context_l2_str = "\n\n".join(l2_ctx) if l2_ctx else ""
-        context_mmr_str = "\n\n".join(mmr_ctx) if mmr_ctx else ""
-        l2_faithfulness = get_faithfulness_score(nli_model, context_l2_str, answer_l2)
-        mmr_faithfulness = get_faithfulness_score(nli_model, context_mmr_str, answer_mmr)
+        cov_b1 = calc_answer_coverage(gt_pieces, answer_b1)
+        cov_b2 = calc_answer_coverage(gt_pieces, answer_b2)
+        cov_mmr = calc_answer_coverage(gt_pieces, answer_mmr)
 
-        l2_semantic.append(s_l2)
+        b1_semantic.append(s_b1)
+        b2_semantic.append(s_b2)
         mmr_semantic.append(s_mmr)
-        l2_unique_list.append(l2_unique_ratio)
+        b1_unique_list.append(b1_unique_ratio)
+        b2_unique_list.append(b2_unique_ratio)
         mmr_unique_list.append(mmr_unique_ratio)
-        l2_faith_list.append(l2_faithfulness)
-        mmr_faith_list.append(mmr_faithfulness)
+        b1_coverage_list.append(cov_b1)
+        b2_coverage_list.append(cov_b2)
+        mmr_coverage_list.append(cov_mmr)
 
-        raw_item["answer_l2"] = answer_l2
+        raw_item["answer_b1"] = answer_b1
+        raw_item["answer_b2"] = answer_b2
         raw_item["answer_mmr"] = answer_mmr
-        raw_item["l2_answer"] = answer_l2
+        raw_item["b1_answer"] = answer_b1
+        raw_item["b2_answer"] = answer_b2
         raw_item["mmr_answer"] = answer_mmr
-        raw_item["l2_semantic"] = s_l2
+        raw_item["b1_semantic"] = s_b1
+        raw_item["b2_semantic"] = s_b2
         raw_item["mmr_semantic"] = s_mmr
-        raw_item["l2_unique_ratio"] = l2_unique_ratio
+        raw_item["b1_unique_ratio"] = b1_unique_ratio
+        raw_item["b2_unique_ratio"] = b2_unique_ratio
         raw_item["mmr_unique_ratio"] = mmr_unique_ratio
-        raw_item["l2_faithfulness"] = l2_faithfulness
-        raw_item["mmr_faithfulness"] = mmr_faithfulness
+        raw_item["b1_answer_coverage"] = cov_b1
+        raw_item["b2_answer_coverage"] = cov_b2
+        raw_item["mmr_answer_coverage"] = cov_mmr
         raw_item["ground_truth_pieces"] = gt_pieces
 
         jr: Dict[str, Any] = {}
@@ -826,14 +877,16 @@ def run_eval(
                     model,
                     tokenizer,
                     query,
-                    answer_l2,
+                    answer_b1,
+                    answer_b2,
                     answer_mmr,
                     max_new_tokens=judge_max_new_tokens,
                 )
             else:
                 jr = evaluate_with_llm_judge(
                     query,
-                    answer_l2,
+                    answer_b1,
+                    answer_b2,
                     answer_mmr,
                     provider=jb,
                     model=judge_model,
@@ -846,14 +899,18 @@ def run_eval(
             "idx": i,
             "query": query,
             "ground_truth": gt,
-            "answer_l2": answer_l2,
+            "answer_b1": answer_b1,
+            "answer_b2": answer_b2,
             "answer_mmr": answer_mmr,
-            "l2_semantic": f"{s_l2:.6f}",
+            "b1_semantic": f"{s_b1:.6f}",
+            "b2_semantic": f"{s_b2:.6f}",
             "mmr_semantic": f"{s_mmr:.6f}",
-            "l2_unique_ratio": f"{l2_unique_ratio:.6f}",
+            "b1_unique_ratio": f"{b1_unique_ratio:.6f}",
+            "b2_unique_ratio": f"{b2_unique_ratio:.6f}",
             "mmr_unique_ratio": f"{mmr_unique_ratio:.6f}",
-            "l2_faithfulness": f"{l2_faithfulness:.6f}",
-            "mmr_faithfulness": f"{mmr_faithfulness:.6f}",
+            "b1_answer_coverage": f"{cov_b1:.6f}",
+            "b2_answer_coverage": f"{cov_b2:.6f}",
+            "mmr_answer_coverage": f"{cov_mmr:.6f}",
             "num_gt_pieces": str(len(gt_pieces)),
         }
         if run_judge:
@@ -864,22 +921,27 @@ def run_eval(
             "query_idx": i,
             "query": query,
             "ground_truth": gt,
-            "generation": {"answer_l2": answer_l2, "answer_mmr": answer_mmr},
-            "metrics": {
-                "l2_semantic_similarity": s_l2,
-                "mmr_semantic_similarity": s_mmr,
-                "l2_unique_token_ratio": l2_unique_ratio,
-                "mmr_unique_token_ratio": mmr_unique_ratio,
-                "l2_nli_faithfulness": l2_faithfulness,
-                "mmr_nli_faithfulness": mmr_faithfulness,
+            "generation": {
+                "answer_b1": answer_b1,
+                "answer_b2": answer_b2,
+                "answer_mmr": answer_mmr,
             },
-            "hallucination_heuristic": _faithfulness_hallucination_flags(
-                l2_faithfulness, mmr_faithfulness
-            ),
+            "metrics": {
+                "b1_semantic_similarity": s_b1,
+                "b2_semantic_similarity": s_b2,
+                "mmr_semantic_similarity": s_mmr,
+                "b1_unique_token_ratio": b1_unique_ratio,
+                "b2_unique_token_ratio": b2_unique_ratio,
+                "mmr_unique_token_ratio": mmr_unique_ratio,
+                "b1_answer_coverage": cov_b1,
+                "b2_answer_coverage": cov_b2,
+                "mmr_answer_coverage": cov_mmr,
+            },
         }
         if include_prompts:
             detail["prompt"] = {
-                "l2": build_generation_prompt(query, l2_ctx),
+                "b1": build_generation_prompt(query, b1_ctx),
+                "b2": build_generation_prompt(query, b2_ctx),
                 "mmr": build_generation_prompt(query, mmr_ctx),
             }
         if run_judge:
@@ -891,12 +953,15 @@ def run_eval(
         "model_name": model_name,
         "quantization": quantization.upper(),
         "num_samples": n,
-        "l2_semantic_avg": sum(l2_semantic) / n if n else 0.0,
+        "b1_semantic_avg": sum(b1_semantic) / n if n else 0.0,
+        "b2_semantic_avg": sum(b2_semantic) / n if n else 0.0,
         "mmr_semantic_avg": sum(mmr_semantic) / n if n else 0.0,
-        "l2_unique_ratio_avg": sum(l2_unique_list) / n if n else 0.0,
+        "b1_unique_ratio_avg": sum(b1_unique_list) / n if n else 0.0,
+        "b2_unique_ratio_avg": sum(b2_unique_list) / n if n else 0.0,
         "mmr_unique_ratio_avg": sum(mmr_unique_list) / n if n else 0.0,
-        "l2_faithfulness_avg": sum(l2_faith_list) / n if n else 0.0,
-        "mmr_faithfulness_avg": sum(mmr_faith_list) / n if n else 0.0,
+        "b1_coverage_avg": sum(b1_coverage_list) / n if n else 0.0,
+        "b2_coverage_avg": sum(b2_coverage_list) / n if n else 0.0,
+        "mmr_coverage_avg": sum(mmr_coverage_list) / n if n else 0.0,
     }
     if run_judge and judge_rows:
         report.update(aggregate_judge_stats(judge_rows))
@@ -908,7 +973,6 @@ def run_eval(
             model,
             tokenizer,
             semantic_encoder,
-            nli_model,
         )
     return report, csv_rows, per_query_details
 
@@ -924,30 +988,36 @@ def print_report(report: Dict[str, Any]) -> None:
     print(f"  [현재 양자화 수준: {q}]  (샘플 수: {n})")
     print("=" * 60)
     print("  Semantic Similarity (평균, GT에 [SEP] 시 조각별 max):")
-    print(f"    L2  Top-K 컨텍스트: {report.get('l2_semantic_avg', 0):.4f}")
+    print(f"    B1  Top-K 컨텍스트: {report.get('b1_semantic_avg', 0):.4f}")
+    print(f"    B2  Top-K 컨텍스트: {report.get('b2_semantic_avg', 0):.4f}")
     print(f"    MMR Top-K 컨텍스트: {report.get('mmr_semantic_avg', 0):.4f}")
     print("  Unique Token Ratio (고유 단어 비율, 평균):")
-    print(f"    L2  생성 답변: {report.get('l2_unique_ratio_avg', 0):.4f}")
+    print(f"    B1  생성 답변: {report.get('b1_unique_ratio_avg', 0):.4f}")
+    print(f"    B2  생성 답변: {report.get('b2_unique_ratio_avg', 0):.4f}")
     print(f"    MMR 생성 답변: {report.get('mmr_unique_ratio_avg', 0):.4f}")
-    print("  NLI Faithfulness (Entailment 확률 평균, 문맥 vs 생성 답변):")
-    print(f"    L2  컨텍스트: {report.get('l2_faithfulness_avg', 0):.4f}")
-    print(f"    MMR 컨텍스트: {report.get('mmr_faithfulness_avg', 0):.4f}")
+    print("  Answer Coverage (GT Token Recall, 평균):")
+    print(f"    B1  생성 답변: {report.get('b1_coverage_avg', 0):.4f}")
+    print(f"    B2  생성 답변: {report.get('b2_coverage_avg', 0):.4f}")
+    print(f"    MMR 생성 답변: {report.get('mmr_coverage_avg', 0):.4f}")
     if report.get("judge_n"):
-        print("  LLM-as-a-Judge (A=L2, B=MMR):")
+        print("  LLM-as-a-Judge (A=B1, B=B2, C=MMR):")
         print(
-            f"    승: L2={report.get('judge_wins_l2', 0)}, "
+            f"    승: B1={report.get('judge_wins_b1', 0)}, "
+            f"B2={report.get('judge_wins_b2', 0)}, "
             f"MMR={report.get('judge_wins_mmr', 0)}, "
             f"무승부={report.get('judge_ties', 0)} "
-            f"(비율 L2/MMR/TIE: "
-            f"{report.get('judge_win_rate_l2', 0):.2f} / "
+            f"(비율 B1/B2/MMR/TIE: "
+            f"{report.get('judge_win_rate_b1', 0):.2f} / "
+            f"{report.get('judge_win_rate_b2', 0):.2f} / "
             f"{report.get('judge_win_rate_mmr', 0):.2f} / "
             f"{report.get('judge_tie_rate', 0):.2f})"
         )
         for k in ("comprehensiveness", "conciseness", "faithfulness"):
             ka = report.get(f"judge_avg_A_{k}")
             kb = report.get(f"judge_avg_B_{k}")
-            if ka is not None and kb is not None:
-                print(f"    평균 점수 {k}: A(L2)={ka:.2f}, B(MMR)={kb:.2f}")
+            kc = report.get(f"judge_avg_C_{k}")
+            if ka is not None and kb is not None and kc is not None:
+                print(f"    평균 점수 {k}: A(B1)={ka:.2f}, B(B2)={kb:.2f}, C(MMR)={kc:.2f}")
     print("=" * 60)
 
 
@@ -1017,9 +1087,7 @@ def run_llm_pipeline_from_retrieval(
     from sentence_transformers import SentenceTransformer
 
     semantic_encoder = SentenceTransformer(semantic_model)
-    print("[로드] NLI 모델 (Faithfulness 평가용) 불러오는 중...", flush=True)
-    nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-base")
-    preloaded: PreloadedModels = (model, tokenizer, semantic_encoder, nli_model)
+    preloaded: PreloadedModels = (model, tokenizer, semantic_encoder)
 
     summary_rows: List[Dict[str, Any]] = []
 
@@ -1034,19 +1102,26 @@ def run_llm_pipeline_from_retrieval(
         "num_queries",
         "model_name",
         "quantization",
-        "avg_l2_semantic_similarity",
+        "avg_b1_semantic_similarity",
+        "avg_b2_semantic_similarity",
         "avg_mmr_semantic_similarity",
-        "avg_l2_unique_token_ratio",
+        "avg_b1_unique_token_ratio",
+        "avg_b2_unique_token_ratio",
         "avg_mmr_unique_token_ratio",
-        "avg_l2_nli_faithfulness",
-        "avg_mmr_nli_faithfulness",
+        "avg_b1_answer_coverage",
+        "avg_b2_answer_coverage",
+        "avg_mmr_answer_coverage",
         "judge_n",
-        "judge_win_rate_l2",
+        "judge_win_rate_b1",
+        "judge_win_rate_b2",
         "judge_win_rate_mmr",
         "judge_tie_rate",
-        "avg_llm_judge_L2_comprehensiveness",
-        "avg_llm_judge_L2_conciseness",
-        "avg_llm_judge_L2_faithfulness",
+        "avg_llm_judge_B1_comprehensiveness",
+        "avg_llm_judge_B1_conciseness",
+        "avg_llm_judge_B1_faithfulness",
+        "avg_llm_judge_B2_comprehensiveness",
+        "avg_llm_judge_B2_conciseness",
+        "avg_llm_judge_B2_faithfulness",
         "avg_llm_judge_MMR_comprehensiveness",
         "avg_llm_judge_MMR_conciseness",
         "avg_llm_judge_MMR_faithfulness",
@@ -1104,7 +1179,6 @@ def run_llm_pipeline_from_retrieval(
                     "prompt": det.get("prompt"),
                     "generation": det.get("generation"),
                     "metrics": det.get("metrics"),
-                    "hallucination_heuristic": det.get("hallucination_heuristic"),
                 }
                 if det.get("judge_result") is not None:
                     line["judge_result"] = det["judge_result"]
@@ -1118,7 +1192,6 @@ def run_llm_pipeline_from_retrieval(
                         "prompt": det.get("prompt"),
                         "generation": det.get("generation"),
                         "metrics": det.get("metrics"),
-                        "hallucination_heuristic": det.get("hallucination_heuristic"),
                         "judge_result": det.get("judge_result"),
                     }
                 )
@@ -1147,30 +1220,37 @@ def run_llm_pipeline_from_retrieval(
                 "domain": first.get("domain"),
                 "num_queries": len(group_rows),
                 "llm_combo_artifact": combo_rel,
-                "avg_l2_semantic_similarity": report.get("l2_semantic_avg"),
+                "avg_b1_semantic_similarity": report.get("b1_semantic_avg"),
+                "avg_b2_semantic_similarity": report.get("b2_semantic_avg"),
                 "avg_mmr_semantic_similarity": report.get("mmr_semantic_avg"),
-                "avg_l2_unique_token_ratio": report.get("l2_unique_ratio_avg"),
+                "avg_b1_unique_token_ratio": report.get("b1_unique_ratio_avg"),
+                "avg_b2_unique_token_ratio": report.get("b2_unique_ratio_avg"),
                 "avg_mmr_unique_token_ratio": report.get("mmr_unique_ratio_avg"),
-                "avg_l2_nli_faithfulness": report.get("l2_faithfulness_avg"),
-                "avg_mmr_nli_faithfulness": report.get("mmr_faithfulness_avg"),
+                "avg_b1_answer_coverage": report.get("b1_coverage_avg"),
+                "avg_b2_answer_coverage": report.get("b2_coverage_avg"),
+                "avg_mmr_answer_coverage": report.get("mmr_coverage_avg"),
                 "model_name": model_name,
                 "quantization": quantization.upper(),
             }
             if report.get("judge_n"):
                 summary_row["judge_n"] = report.get("judge_n")
-                summary_row["judge_win_rate_l2"] = report.get("judge_win_rate_l2")
+                summary_row["judge_win_rate_b1"] = report.get("judge_win_rate_b1")
+                summary_row["judge_win_rate_b2"] = report.get("judge_win_rate_b2")
                 summary_row["judge_win_rate_mmr"] = report.get("judge_win_rate_mmr")
                 summary_row["judge_tie_rate"] = report.get("judge_tie_rate")
                 for k in ("comprehensiveness", "conciseness", "faithfulness"):
                     ka = report.get(f"judge_avg_A_{k}")
                     kb = report.get(f"judge_avg_B_{k}")
+                    kc = report.get(f"judge_avg_C_{k}")
                     if ka is not None:
-                        summary_row[f"avg_llm_judge_L2_{k}"] = ka
+                        summary_row[f"avg_llm_judge_B1_{k}"] = ka
                     if kb is not None:
-                        summary_row[f"avg_llm_judge_MMR_{k}"] = kb
+                        summary_row[f"avg_llm_judge_B2_{k}"] = kb
+                    if kc is not None:
+                        summary_row[f"avg_llm_judge_MMR_{k}"] = kc
             summary_rows.append(summary_row)
 
-    cleanup_generation_gpu_memory(model, tokenizer, semantic_encoder, nli_model)
+    cleanup_generation_gpu_memory(model, tokenizer, semantic_encoder)
 
     union_keys: set = set()
     for sr in summary_rows:
@@ -1211,7 +1291,7 @@ def run_llm_pipeline_from_retrieval(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="CUAD RAG JSON → 로컬 LLM 생성 → Semantic/Unique/NLI Faith + 선택적 LLM Judge → CSV/JSON"
+        description="CUAD RAG JSON → 로컬 LLM 생성 → Semantic/Unique/Answer Coverage + 선택적 LLM Judge → CSV/JSON"
     )
     parser.add_argument(
         "--quantization",
@@ -1236,7 +1316,7 @@ def main() -> None:
         "--eval_data",
         type=str,
         default=None,
-        help="online_accelerator export JSON (query, l2_contexts, mmr_contexts, …)",
+        help="online_accelerator export JSON (query, b1_contexts, b2_contexts, mmr_contexts, …)",
     )
     parser.add_argument(
         "--output_results",
@@ -1372,7 +1452,7 @@ def main() -> None:
         for si, cfg in enumerate(SWEEP_CONFIGS, start=1):
             mname, quant = cfg["model"], cfg["quant"]
             print(f"\n{'=' * 60}\n[sweep {si}/{len(SWEEP_CONFIGS)}] model={mname}  quant={quant}\n{'=' * 60}")
-            report, csv_rows, _per_q, model, tokenizer, semantic_encoder, nli_model = run_eval(
+            report, csv_rows, _per_q, model, tokenizer, semantic_encoder = run_eval(
                 eval_data,
                 model_name=mname,
                 quantization=quant,
@@ -1413,7 +1493,7 @@ def main() -> None:
             run_entry.update(extract_sweep_summary_metrics(report))
             summary_runs.append(run_entry)
 
-            cleanup_generation_gpu_memory(model, tokenizer, semantic_encoder, nli_model)
+            cleanup_generation_gpu_memory(model, tokenizer, semantic_encoder)
 
         summary_path = os.path.abspath(args.sweep_summary)
         with open(summary_path, "w", encoding="utf-8") as f:
