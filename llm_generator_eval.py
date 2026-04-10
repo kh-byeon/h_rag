@@ -437,13 +437,8 @@ def group_retrieval_by_sweep_idx(
 
 
 def retrieval_record_to_eval_item(r: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "query": r.get("query"),
-        "ground_truth": r.get("ground_truth"),
-        "b1_contexts": r.get("b1_contexts"),
-        "b2_contexts": r.get("b2_contexts"),
-        "mmr_contexts": r.get("mmr_contexts"),
-    }
+    """JSONL 원본 행을 그대로 넘겨 normalize_eval_item이 대체 키(question 등)를 처리하도록 한다."""
+    return r.copy()
 
 
 def _as_str_list(val: Any) -> List[str]:
@@ -719,8 +714,10 @@ def sweep_csv_basename(model_id: str, quantization: str) -> str:
 
 
 SWEEP_CONFIGS: List[Dict[str, str]] = [
-    {"model": "meta-llama/Llama-3.2-1B-Instruct", "quant": "int8"},
     {"model": "meta-llama/Llama-3.2-1B-Instruct", "quant": "fp16"},
+    {"model": "meta-llama/Llama-3.2-1B-Instruct", "quant": "int4"},
+    {"model": "meta-llama/Llama-3.2-1B-Instruct", "quant": "int8"},
+    {"model": "meta-llama/Meta-Llama-3-8B-Instruct", "quant": "fp16"},
     {"model": "meta-llama/Meta-Llama-3-8B-Instruct", "quant": "int4"},
     {"model": "meta-llama/Meta-Llama-3-8B-Instruct", "quant": "int8"},
 ]
@@ -1263,11 +1260,29 @@ def run_llm_pipeline_from_retrieval(
     for k in sorted(union_keys):
         ordered_cols.append(k)
 
-    with open(summary_csv, "w", encoding="utf-8", newline="") as sf:
-        w = csv.DictWriter(sf, fieldnames=ordered_cols, extrasaction="ignore")
-        w.writeheader()
+    # 스윕 등 연속 호출 시 이전 양자화/모델 결과가 지워지지 않도록 추가 모드로 기록
+    summary_exists = os.path.isfile(summary_csv) and os.path.getsize(summary_csv) > 0
+    existing_header: Optional[List[str]] = None
+    if summary_exists:
+        with open(summary_csv, "r", encoding="utf-8", newline="") as rf:
+            r0 = next(csv.reader(rf), None)
+            if r0:
+                existing_header = r0
+    if summary_exists and existing_header:
+        fieldnames = existing_header
+        csv_mode = "a"
+        write_header = False
+    else:
+        fieldnames = ordered_cols
+        csv_mode = "w"
+        write_header = True
+
+    with open(summary_csv, csv_mode, encoding="utf-8", newline="") as sf:
+        w = csv.DictWriter(sf, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            w.writeheader()
         for sr in summary_rows:
-            w.writerow({c: sr.get(c, "") for c in ordered_cols})
+            w.writerow({c: sr.get(c, "") for c in fieldnames})
 
     manifest_llm = {
         "run_id": run_id,
@@ -1296,7 +1311,7 @@ def main() -> None:
     parser.add_argument(
         "--quantization",
         type=str,
-        default="fp16",
+        default="int8",
         choices=["fp16", "int8", "int4"],
         help="모델 양자화: fp16, int8, int4",
     )
@@ -1348,7 +1363,7 @@ def main() -> None:
     parser.add_argument(
         "--sweep",
         action="store_true",
-        help="모델×양자화 SWEEP_CONFIGS 를 순회하며 평가 (VRAM 16GB 기준 4조합)",
+        help="모델×양자화 SWEEP_CONFIGS 를 순회하며 평가 (VRAM 16GB 기준 6조합: 1B·8B × fp16·int4·int8)",
     )
     parser.add_argument(
         "--sweep_summary",
