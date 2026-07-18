@@ -124,7 +124,8 @@ def _igzo_log10_v3(
     v_gs: NDArray[np.float64],
     theta,  # iterable of 8 broadcastable arrays or scalars
 ) -> NDArray[np.float64]:
-    I_off, V_th, Vss, I0_sub, I_sat_max, V_sat_scale, gamma, delta = (
+    # theta[2] = ss_v_per_dec (subthreshold swing); not the VSS rail.
+    I_off, V_th, ss_v_per_dec, I0_sub, I_sat_max, V_sat_scale, gamma, delta = (
         theta[0],
         theta[1],
         theta[2],
@@ -136,10 +137,12 @@ def _igzo_log10_v3(
     )
     v_gst = v_gs - V_th
     v_gst_smooth = 0.5 * (v_gst + np.sqrt(v_gst * v_gst + delta * delta))
-    sub_arg = np.minimum(v_gst / Vss, SUB_CAP)
+    sub_arg = SUB_CAP * np.tanh(v_gst / ss_v_per_dec / SUB_CAP)
     i_sub = I0_sub * np.exp(sub_arg)
     tanh_part = np.tanh(v_gst_smooth / V_sat_scale)
-    i_above = I_sat_max * np.power(np.maximum(tanh_part, 1e-15), gamma)
+    from h_aimdc_sim.igzo_powerlaw_model import POWERLAW_EPS
+
+    i_above = I_sat_max * np.power(np.maximum(tanh_part, 0.0) + POWERLAW_EPS, gamma)
     ids = I_off + i_sub + i_above
     return cast(
         NDArray[np.float64],

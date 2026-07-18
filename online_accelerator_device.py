@@ -734,6 +734,9 @@ class L2RAGOnlinePipeline:
                 ).astype(np.float32)
 
             # Section-heading penalty applies ONLY to min, not to raw array (preserves dump semantics).
+            # Sign-safe: same heading ⇒ treat as closer. For positive distances subtract an
+            # offset; for negative distances add |offset| so the value moves toward -inf
+            # (still "closer" under min). Never divide (would invert the penalty for d<0).
             min_d = float("inf")
             for k, s in enumerate(pool):
                 d = float(raw[k])
@@ -741,7 +744,19 @@ class L2RAGOnlinePipeline:
                     continue
                 s_heading = _section_heading_of(s)
                 if cand_heading and s_heading and cand_heading == s_heading:
-                    d = d / self.section_penalty_weight
+                    # offset = (|d|/weight) magnitude relative to |d| kept small: use
+                    # (|d| * (1 - 1/weight)) so positive d: d' = d/weight equivalent,
+                    # negative d: d' = d - |d|*(1-1/weight) = d * (2 - 1/weight) wait.
+                    # Cleaner: d' = d - sign(d) * |d| * (1 - 1/w) = d / w
+                    # which is exactly d/w for all signs... but d/w for negative makes
+                    # d larger (e.g. -3/1.5=-2). We need the opposite for negatives.
+                    # Desired: move toward -inf for "closer" under ascending sort/min.
+                    # positive d: decrease d → d - delta
+                    # negative d: decrease d further → d - delta
+                    # Always subtract a positive delta proportional to |d|.
+                    w = float(self.section_penalty_weight)
+                    delta = abs(d) * (1.0 - 1.0 / w)  # same magnitude as d - d/w for d>0
+                    d = d - delta
                 if d < min_d:
                     min_d = d
             return raw, selected_embs, min_d

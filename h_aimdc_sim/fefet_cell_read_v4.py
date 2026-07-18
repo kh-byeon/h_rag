@@ -437,14 +437,20 @@ def run_analytical_w_sweep(
             model, v_sl=v_sl, w=w, v_fold=v_fold, v_mbl=v_mbl, v_ml=v_ml
         )
         i_cell = np.abs(i_ml)
-        # Continuous refine around the grid argmin (LUT V-curves can be very flat).
+        # Continuous refine in a tight bracket around w (LUT V-curves are nearly flat
+        # for n≈1, so a wide bracket can lock onto interpolation artifacts).
+        half = min(0.3, 0.5 * (float(vmax) - float(vmin)))
+        lo = max(float(vmin), float(w) - half)
+        hi = min(float(vmax), float(w) + half)
+        if hi - lo < 2 * float(vstep):
+            lo, hi = float(vmin), float(vmax)
         v_sl_match = find_match_point_continuous(
             model,
             w=w,
             v_fold=v_fold,
             v_mbl=v_mbl,
             v_ml=v_ml,
-            bracket=(float(vmin), float(vmax)),
+            bracket=(lo, hi),
         )
         i_min = float(np.min(i_cell))
         i_max = float(np.max(i_cell))
