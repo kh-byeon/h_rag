@@ -302,9 +302,7 @@ def _cli_main_v3(argv: list[str] | None = None) -> None:
     p3.add_argument(
         "--vmax", type=float, default=1.0, help="Embedding scaler v_max (default +1.0)"
     )
-    p3.add_argument("--vdd", type=float, default=3.0)
-    p3.add_argument("--vgg", type=float, default=3.0)
-    p3.add_argument("--vss", type=float, default=-3.0)
+    p3.add_argument("--v-fold", dest="v_fold", type=float, default=0.0)
     p3.add_argument("--v-mbl", dest="v_mbl", type=float, default=0.5)
     p3.add_argument("--v-ml", dest="v_ml", type=float, default=0.0)
     p3.add_argument(
@@ -312,9 +310,9 @@ def _cli_main_v3(argv: list[str] | None = None) -> None:
         dest="operating_point",
         type=str,
         default=None,
-        help="Path to NVM operating-point JSON (from fefet_cell_read_v3.py "
-             "--save-operating-point). When set, circuit_params are loaded from "
-             "the JSON. Explicit CLI flags (--vdd, --vgg, ...) override the JSON.",
+        help="Path to NVM operating-point JSON (from fefet_cell_read_v4.py "
+             "--save-operating-point; schema_version 2). When set, circuit_params "
+             "are loaded from the JSON. Explicit CLI flags override the JSON.",
     )
 
     # fit_v1 (re-export of existing CLI for convenience)
@@ -340,10 +338,13 @@ def _cli_main_v3(argv: list[str] | None = None) -> None:
             if not isinstance(loaded, dict):
                 raise ValueError(f"Operating-point JSON must be an object: {op_path}")
             op_data = loaded
-            if int(op_data.get("schema_version", 0)) != 1:
+            if int(op_data.get("schema_version", 0)) != 2:
                 raise ValueError(
                     "Unsupported operating-point schema_version: "
-                    f"{op_data.get('schema_version')!r} (expected 1)"
+                    f"{op_data.get('schema_version')!r} (expected 2). "
+                    "schema_version 1 (VDD/VGG/VSS inverter biases) was retired with "
+                    "the 2-FeFET cell migration; regenerate via "
+                    "fefet_cell_read_v4.py --save-operating-point."
                 )
             cp_in = op_data.get("circuit_params") or {}
             if not isinstance(cp_in, dict):
@@ -360,9 +361,7 @@ def _cli_main_v3(argv: list[str] | None = None) -> None:
                     print(f"[fit_v3]   validation slope = {float(slope):g}, R^2 = {float(r2):g}")
 
         attr_to_json = {
-            "vdd": "VDD",
-            "vgg": "VGG",
-            "vss": "VSS",
+            "v_fold": "V_FOLD",
             "v_mbl": "V_MBL",
             "v_ml": "V_ML",
             "vmin": "v_min",
@@ -370,9 +369,7 @@ def _cli_main_v3(argv: list[str] | None = None) -> None:
         }
         json_to_attr = {v: k for k, v in attr_to_json.items()}
         flag_to_attr = {
-            "--vdd": "vdd",
-            "--vgg": "vgg",
-            "--vss": "vss",
+            "--v-fold": "v_fold",
             "--v-mbl": "v_mbl",
             "--v-ml": "v_ml",
             "--vmin": "vmin",
@@ -390,13 +387,14 @@ def _cli_main_v3(argv: list[str] | None = None) -> None:
             return float(cli_value)
 
         circuit_params: dict[str, Any] = {
-            "VDD": _resolve("vdd", args.vdd, "VDD"),
-            "VGG": _resolve("vgg", args.vgg, "VGG"),
-            "VSS": _resolve("vss", args.vss, "VSS"),
+            "V_FOLD": _resolve("v_fold", args.v_fold, "V_FOLD"),
             "V_MBL": _resolve("v_mbl", args.v_mbl, "V_MBL"),
             "V_ML": _resolve("v_ml", args.v_ml, "V_ML"),
             "v_min": _resolve("vmin", args.vmin, "v_min"),
             "v_max": _resolve("vmax", args.vmax, "v_max"),
+            "v_ds_factor_note": (
+                "UNVALIDATED HEURISTIC: V_DS factor never fitted to multi-V_DS data"
+            ),
         }
 
         if op_data and op_validation and "validated_at" in op_data:

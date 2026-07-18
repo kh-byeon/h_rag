@@ -181,8 +181,24 @@ def save_fit_json(
 def load_fit_json(path: str) -> tuple[NDArray[np.float64], dict[str, Any]]:
     with open(path, encoding="utf-8") as f:
         d = json.load(f)
+    model = d.get("model")
+    # Dispatch on explicit model string when present (schema_version >= 2 / FeFET).
+    if isinstance(model, str) and model.startswith("fefet_ref_"):
+        popt = np.asarray(d.get("popt", []), dtype=np.float64)
+        meta = {k: v for k, v in d.items() if k != "popt"}
+        return popt, meta
+    if isinstance(model, str) and model in ("igzo_composite_v1", "igzo_powerlaw_v3"):
+        popt = np.asarray(d["popt"], dtype=np.float64)
+        meta = {k: v for k, v in d.items() if k != "popt"}
+        return popt, meta
+    # Legacy: infer from popt length (7 = v1 composite, 8 = v3 powerlaw).
     popt = np.asarray(d["popt"], dtype=np.float64)
     meta = {k: v for k, v in d.items() if k != "popt"}
+    if "model" not in meta:
+        if popt.size == 7:
+            meta["model"] = "igzo_composite_v1"
+        elif popt.size == 8:
+            meta["model"] = "igzo_powerlaw_v3"
     return popt, meta
 
 

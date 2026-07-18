@@ -2470,7 +2470,7 @@ def run_mmr_evaluation(
 
         print("=" * 68)
         print("[NVM Centroid Accelerator] Operating point in use:")
-        print(f"  Inverter:   VDD={_fmt('VDD')}  VGG={_fmt('VGG')}  VSS={_fmt('VSS')}")
+        print(f"  Fold:       V_FOLD={_fmt('V_FOLD', fallback='0.000V')}")
         if np.isfinite(v_ds_eff):
             print(
                 f"  Cell bias:  V_MBL={_fmt('V_MBL')}  V_ML={v_ml_used:.3f}V"
@@ -2484,8 +2484,9 @@ def run_mmr_evaluation(
                 f"  Scaler:     raw [{centroid_dd._x_lo:+.4g}, {centroid_dd._x_hi:+.4g}] "
                 f"-> V [{centroid_dd.v_min:+.3f}, {centroid_dd.v_max:+.3f}]"
             )
-        inverter_mode = "LUT (loaded)" if centroid_dd._inv_v_in is not None else "Ideal (-V_A)"
-        print(f"  Inverter:   {inverter_mode}")
+        print(f"  Reduction:  {centroid_dd.reduce}")
+        p_val = centroid_dd.p
+        print(f"  power_law_p={p_val if p_val is not None else 'n/a'}")
         if validated_at:
             print(f"  Validated:  {validated_at}")
         if op_source:
@@ -3556,8 +3557,8 @@ if __name__ == "__main__":
         "--centroid_inverter_vtc_path",
         type=str,
         default=None,
-        help="Path to inverter VTC npz for column-shared inverter modeling "
-             "(Phase 1.5). When omitted, NvmDeviceDistance falls back to ideal -V_A.",
+        help="DEPRECATED: ignored. The 2-FeFET cell uses exact V_FOLD complement; "
+             "inverter VTC LUT has no role. Accepted for one release.",
     )
     # Legacy (no coverage gate / no re-query):
     #   python online_accelerator_device.py --mode eval --num_queries 1
