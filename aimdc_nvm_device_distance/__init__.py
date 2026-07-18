@@ -182,13 +182,28 @@ class NvmDeviceDistance:
         )
         # Legacy IGZO path still expects an 8-vector; FeFET LUT may have empty popt.
         popt_a = np.asarray(popt, dtype=np.float64).ravel()
-        if self._is_fefet and popt_a.size == 0:
-            self._theta = np.zeros(0, dtype=np.float64)
+        self._fefet_model = None
+        if self._is_fefet:
+            backend = self._meta.get("backend")
+            has_lut = backend == "lut" and "v_grid" in self._meta
+            # load_fit_json strips arrays into meta only if present in JSON;
+            # re-read via load_fefet_ref_fit when the file is a real FeFET fit.
+            try:
+                from h_aimdc_sim.fefet_ref_model import load_fefet_ref_fit
+
+                self._fefet_model = load_fefet_ref_fit(self.fit_json_path)
+            except (KeyError, ValueError, TypeError):
+                self._fefet_model = None
+            self._theta = (
+                np.zeros(0, dtype=np.float64)
+                if popt_a.size == 0
+                else popt_a.astype(np.float64, copy=False)
+            )
         else:
             if popt_a.size != 8:
                 raise ValueError(
                     f"NvmDeviceDistance: expected 8-param IGZO popt, got {popt_a.size} "
-                    f"(model={model_name!r}). FeFET fits must set model/backend metadata."
+                    f"(model={model_name!r})."
                 )
             self._theta = popt_a.reshape(8)
         cp = dict(DEFAULT_CIRCUIT_PARAMS)
@@ -375,18 +390,48 @@ class NvmDeviceDistance:
         shape = tuple(np.broadcast_shapes(v_sl_a.shape, v_prg_a.shape))
         v_sl_b = np.broadcast_to(v_sl_a, shape)
         v_prg_b = np.broadcast_to(v_prg_a, shape)
-        th = self._theta
         noise = self.noise
         rng = self._rng
         v_ml = self.v_ml
 
-        # Phase 1.5: Inverter is column-shared. _inverter(v_sl_b) is evaluated once on
-        # the query-side voltages (shape (M, 1, D) before broadcast), reflecting that
-        # in real hardware one inverter per column drives all N cells in parallel.
-        # - Without inverter_vtc_path: ideal sign-flip (V_B = -V_A), same as Phase 1.
-        # - With inverter_vtc_path: 1D LUT interpolation captures actual VTC nonlinearity.
-        # Phase 2 candidates: load-dependent inverter VTC (V_A, n_cells) -> V_B,
-        # ML-line IR drop correction (per-row source perturbation).
+        if self._fefet_model is not None:
+            # 2-FeFET cell: w = V_PRG, complement via V_FOLD.
+            w = v_prg_b
+            if noise.enabled() and noise.sigma_vth > 0.0:
+                w = w + rng.normal(0.0, noise.sigma_vth, size=shape)
+            if noise.enabled() and noise.retention_tau is not None and noise.t_hold > 0.0:
+                w = w * np.exp(-noise.t_hold / float(noise.retention_tau))
+            v_fold = float(self.v_fold)
+            g1 = v_sl_b - w - v_ml
+            g2 = (v_fold - v_sl_b) - (v_fold - w) - v_ml  # = w - v_sl - v_ml
+            # Evaluate ref model; allow_extrapolation for batch distance (scaler may
+            # push edges). Validity is enforced at deck/config time.
+            flat1 = g1.reshape(-1)
+            flat2 = g2.reshape(-1)
+            i1 = self._fefet_model.current(flat1, dv=0.0, allow_extrapolation=True)
+            i2 = self._fefet_model.current(flat2, dv=0.0, allow_extrapolation=True)
+            i_out = (i1 + i2).reshape(shape)
+            if noise.enabled():
+                if noise.flicker_sigma > 0.0:
+                    i_out = i_out * (1.0 + rng.normal(0.0, noise.flicker_sigma, size=shape))
+                if noise.rtn_sigma > 0.0:
+                    i_out = i_out * (1.0 + rng.normal(0.0, noise.rtn_sigma, size=shape))
+                if noise.shot_enable:
+                    q_e = 1.602176634e-19
+                    sigma_shot = np.sqrt(
+                        2.0 * q_e * np.maximum(i_out, 0.0) * float(noise.read_bandwidth_hz)
+                    )
+                    i_out = np.maximum(i_out + rng.normal(0.0, sigma_shot, size=shape), 0.0)
+                if noise.adc_bits is not None:
+                    levels = 2 ** int(noise.adc_bits)
+                    step = float(noise.adc_i_fullscale) / float(levels)
+                    i_out = np.clip(
+                        np.round(i_out / step) * step, 0.0, float(noise.adc_i_fullscale)
+                    )
+            return cast(NDArray[np.float64], i_out.astype(np.float64, copy=False))
+
+        th = self._theta
+        # Legacy IGZO + inverter path.
         v_b_inv = self._inverter(v_sl_b)
         if not noise.enabled():
             v_gs_a = v_sl_b - v_prg_b - v_ml
