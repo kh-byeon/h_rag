@@ -3,7 +3,9 @@ accelerate
 sentencepiece
 bitsandbytes
 pandas
+openpyxl
 tqdm
 datasets
 scipy
 umap-learn
+rouge-score
