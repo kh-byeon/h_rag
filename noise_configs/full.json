@@ -1,0 +1,9 @@
+{
+  "sigma_vth": 0.03,
+  "sigma_log_mu": 0.05,
+  "retention_tau": 10.0,
+  "t_hold": 0.01,
+  "adc_bits": 8,
+  "adc_i_fullscale": 1e-6,
+  "rng_seed": 42
+}

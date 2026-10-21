@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "ref_code": 300,
+  "fit_window_v": [
+    -3.0,
+    2.0
+  ],
+  "states": [
+    {
+      "code": 300,
+      "dv": 0.0,
+      "residual_rmse_dec": 0.0,
+      "noise_ratio": 0.0,
+      "source_sha256": "c84393032c45f36d74a6afea025b59addc90a4f2b1ca4efd715282410dcc7e23",
+      "measured_at": "2026-07-18T15:50:22"
+    },
+    {
+      "code": 400,
+      "dv": 0.21944885885992726,
+      "residual_rmse_dec": 0.03852232302365668,
+      "noise_ratio": 1.1847546436087213,
+      "source_sha256": "1ab81177f387cbc5af9391dc66dba106b7c3090e4d0146cd5133ac48398efd6e",
+      "measured_at": "2026-07-18T15:43:16"
+    },
+    {
+      "code": 500,
+      "dv": 0.5625760214030626,
+      "residual_rmse_dec": 0.06337462200497518,
+      "noise_ratio": 2.5537326899557926,
+      "source_sha256": "846c8be0a44e52b048cd724141943b5939e712af3d6bede9ef17a07d1a878dc1",
+      "measured_at": "2026-07-18T15:40:08"
+    },
+    {
+      "code": 600,
+      "dv": 0.8379343316795187,
+      "residual_rmse_dec": 0.034664269194798286,
+      "noise_ratio": 1.3821002770029072,
+      "source_sha256": "6cc3025e487e1f221337489eb76a2e1a264e62afaf98d8b83b9063581e79e385",
+      "measured_at": "2026-07-18T15:36:12"
+    },
+    {
+      "code": 700,
+      "dv": 1.1254301512576599,
+      "residual_rmse_dec": 0.03552469714498491,
+      "noise_ratio": 1.6348367259105319,
+      "source_sha256": "c2e5fedeafc8ad9e716be898fe7dfc1f401e081d0efd11bdbf912daf1235e492",
+      "measured_at": "2026-07-18T15:30:43"
+    },
+    {
+      "code": 800,
+      "dv": 0.8545475699163356,
+      "residual_rmse_dec": 0.11300154660332434,
+      "noise_ratio": 3.6760735510209015,
+      "source_sha256": "3cc0ea36b80a6a00ffea79d5df8b0d07be646ad93268f5e7d0babae52ac69b6b",
+      "measured_at": "2026-07-18T14:57:38"
+    },
+    {
+      "code": 900,
+      "dv": 0.96148408880807,
+      "residual_rmse_dec": 0.1054146515001311,
+      "noise_ratio": 4.308429969946294,
+      "source_sha256": "0e2eb2c16f2e6c8ddbd690c897016e07e9873f2a5008be199d18430e155a7394",
+      "measured_at": "2026-07-18T14:58:58"
+    },
+    {
+      "code": 1000,
+      "dv": 1.4449604991677885,
+      "residual_rmse_dec": 0.07281031081841274,
+      "noise_ratio": 3.865387616410838,
+      "source_sha256": "f4a4608a043d1172a3b0b531c3d5df1f833cab58c3910f53fcd356011c776ccb",
+      "measured_at": "2026-07-18T15:08:30"
+    },
+    {
+      "code": 1100,
+      "dv": 1.7574055502023405,
+      "residual_rmse_dec": 0.0745325805919231,
+      "noise_ratio": 3.738949833465996,
+      "source_sha256": "d05a1b628365906897561b4ee23837e6123f29a8573f2098ee5f3854d2830ff8",
+      "measured_at": "2026-07-18T15:11:02"
+    },
+    {
+      "code": 1200,
+      "dv": 1.9458785388048585,
+      "residual_rmse_dec": 0.0837626262682371,
+      "noise_ratio": 4.413045013944355,
+      "source_sha256": "d7d429ca13cc62ffe159bb140456f16fbc875fcb63d556ef678e63801575e5af",
+      "measured_at": "2026-07-18T15:13:03"
+    },
+    {
+      "code": 1500,
+      "dv": 1.8812742504189885,
+      "residual_rmse_dec": 0.11627467867383877,
+      "noise_ratio": 5.684239319326164,
+      "source_sha256": "df6b83907db0e6a4f9c131098516f83fd664c616b821ad1b97bebc010a86e22a",
+      "measured_at": "2026-07-18T15:17:26"
+    },
+    {
+      "code": 1600,
+      "dv": 1.953156576580396,
+      "residual_rmse_dec": 0.1280483747954571,
+      "noise_ratio": 6.7620098514686395,
+      "source_sha256": "9da5980f733420bbc3d15a471eac9d2e1a10c9c6b0222c034a8b7c1af0516924",
+      "measured_at": "2026-07-18T15:19:12"
+    },
+    {
+      "code": 1700,
+      "dv": 2.254560985948036,
+      "residual_rmse_dec": 0.12442389065497325,
+      "noise_ratio": 6.514549219559527,
+      "source_sha256": "01e6bbfe8ded485fafac59e9780078dac6133db84e7929370bdd51587ea34923",
+      "measured_at": "2026-07-18T15:14:26"
+    }
+  ],
+  "model_linear": {
+    "slope_v_per_code": 0.0014940522400296245,
+    "intercept_v": -0.19832193302441506,
+    "r_squared": 0.9062402226768844
+  },
+  "model_log": {
+    "a": -7.432542365408729,
+    "b": 1.2851847788342479,
+    "r_squared": 0.9373404829398198
+  },
+  "preferred_model": "log",
+  "vth_span_v": 2.254560985948036,
+  "measurement": {
+    "v_g_min": -5.0,
+    "v_g_max": 2.0,
+    "v_ds": -0.5,
+    "i_floor_a": 1.0989e-08,
+    "rel_noise": 0.05003474462173717,
+    "n_states": 13,
+    "missing_codes": []
+  }
+}

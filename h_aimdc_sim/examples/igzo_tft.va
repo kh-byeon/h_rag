@@ -1,0 +1,12 @@
+// Placeholder IGZO-style VA for container smoke-test (replace with your model).
+`include "/opt/va-std/disciplines.vams"
+`include "/opt/va-std/constants.vams"
+
+module igzo_tft(p, n);
+  inout p, n;
+  electrical p, n;
+  parameter real R = 1e6 from (0:inf);
+
+  analog
+    I(p, n) <+ V(p, n) / R;
+endmodule

@@ -57,6 +57,8 @@ def _fit_device_on_pq_recon(
     scaler_path: str,
     device_reduce: str,
     device_use_log: bool,
+    v_min: Optional[float] = None,
+    v_max: Optional[float] = None,
 ) -> Any:
     from aimdc_device_distance import DeviceDistance, NoiseModel
 
@@ -68,6 +70,8 @@ def _fit_device_on_pq_recon(
         use_log=bool(device_use_log),
         v_ml=0.0,
         noise=NoiseModel(),
+        v_min=v_min,
+        v_max=v_max,
     )
     if not os.path.isfile(scaler_path):
         dd.fit_scaler(np.asarray(pq_recon, dtype=np.float64))
@@ -86,6 +90,8 @@ def run_calibration(
     device_use_log: bool = True,
     max_pq_rows: int = 50_000,
     device: Any = None,
+    v_min: Optional[float] = None,
+    v_max: Optional[float] = None,
 ) -> Dict[str, Any]:
     hw = load_hw_state_from_dir(os.path.abspath(offline_dir))
     raw = hw.get("raw_embeddings")
@@ -121,6 +127,8 @@ def run_calibration(
                 scaler_path=scaler_tmp,
                 device_reduce=device_reduce,
                 device_use_log=device_use_log,
+                v_min=v_min,
+                v_max=v_max,
             )
         finally:
             try:
@@ -146,7 +154,7 @@ def run_calibration(
     arr = np.asarray(ratios, dtype=np.float64)
     k = float(np.median(arr))
     p5, p50, p95 = (float(np.percentile(arr, p)) for p in (5.0, 50.0, 95.0))
-    return {
+    payload: Dict[str, Any] = {
         "k": k,
         "n_queries": int(len(ratios)),
         "n_candidates": int(n_c),
@@ -158,6 +166,14 @@ def run_calibration(
         "reduction_mode": "mean" if device_reduce == "mean" else "sum",
         "fit_sha256": _fit_sha256(device_fit_path),
     }
+    # Record the operating window so the runtime can detect a window mismatch.
+    # (device may be a custom object without v_min/v_max, e.g. in unit tests.)
+    dv_min = getattr(device, "v_min", None)
+    dv_max = getattr(device, "v_max", None)
+    if dv_min is not None and dv_max is not None:
+        payload["v_min"] = float(dv_min)
+        payload["v_max"] = float(dv_max)
+    return payload
 
 
 def main() -> None:
@@ -170,6 +186,10 @@ def main() -> None:
     p.add_argument("--out_json", type=str, required=True)
     p.add_argument("--device_reduce", type=str, default="sum", choices=["sum", "mean"])
     p.add_argument("--device_use_log", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--v_min", type=float, default=-3.0,
+                   help="Operating voltage window lower bound (default -3.0, matches MMR device path).")
+    p.add_argument("--v_max", type=float, default=3.0,
+                   help="Operating voltage window upper bound (default 3.0).")
     args = p.parse_args()
     payload = run_calibration(
         args.offline_dir,
@@ -179,6 +199,8 @@ def main() -> None:
         seed=int(args.seed),
         device_reduce=str(args.device_reduce),
         device_use_log=bool(args.device_use_log),
+        v_min=float(args.v_min),
+        v_max=float(args.v_max),
     )
     out_path = os.path.abspath(args.out_json)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -193,6 +215,11 @@ def main() -> None:
         f"[calibrate_k] ratio percentiles: p5={rs['p5']:.4e}  p50={rs['p50']:.4e}  p95={rs['p95']:.4e}"
     )
     print(f"[calibrate_k] k (median of per-query medians) = {payload['k']:.4e}")
+    if "v_min" in payload and "v_max" in payload:
+        print(
+            f"[calibrate_k] operating window: "
+            f"v_min={payload['v_min']:g}, v_max={payload['v_max']:g}"
+        )
     print(f"[calibrate_k] Saved: {out_path}")
     print(f"[calibrate_k] Apply at runtime: --device_scale_k_path {out_path}")
 

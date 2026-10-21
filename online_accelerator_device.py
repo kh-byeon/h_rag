@@ -34,6 +34,18 @@ T_CANDIDATES_MS = 1.0  # T_candidates: posting list 로드
 T_L2_MS = 2.0       # T_L2: L2 거리 + MMR 연산 (후보 1개당 비례 가정)
 
 
+
+def _ws_count(ws: Dict[str, int], sticky_event: str) -> None:
+    """Bin one sticky-insert outcome into the write-stats counters."""
+    if sticky_event == "appended_not_full":
+        ws["n_write_append"] += 1
+    elif sticky_event == "replaced_lowest":
+        ws["n_write_replace"] += 1
+    elif sticky_event == "rejected_low_score":
+        ws["n_reject_score"] += 1
+    # "buffer_top_k_zero" cannot occur inside the loop (mmr_slots > 0 guard).
+
+
 class L2RAGOnlinePipeline:
     """
     H-AIMDC 하드웨어 가속기 기반 실시간 L2 검색 및 On-the-fly MMR 파이프라인 (CUAD 전용).
@@ -49,6 +61,7 @@ class L2RAGOnlinePipeline:
         tau_dup: float = 0.5,
         mmr_lambda: float = 0.5,
         gamma: float = 0.25,
+        anchor_protect_n: int = 0,
         section_penalty_weight: float = 1.5,
         log_facets: bool = True,
         verbose: bool = True,
@@ -61,6 +74,8 @@ class L2RAGOnlinePipeline:
         device_distance: Optional["DeviceDistance"] = None,
         centroid_device_distance: Optional["NvmDeviceDistance"] = None,
         device_scale_k: Optional[float] = None,
+        standardize_mmr_terms: bool = True,
+        retrieval_scope: str = "intra",
     ):
         # 오프라인에서 로드된 하드웨어 상태 (Pre-loaded data)
         self.centroids = hw_ready_state.get("l2_accelerator_1_centroids")
@@ -69,8 +84,22 @@ class L2RAGOnlinePipeline:
         self.metadata_sram = hw_ready_state.get("metadata_sram")
 
         self.domain_mode = (domain_mode or hw_ready_state.get("domain_mode") or "cuad").lower()
-        if self.domain_mode != "cuad":
+        if self.domain_mode not in ("cuad", "hotpot"):
             self.domain_mode = "cuad"
+        # retrieval scope: "intra" = single target-doc candidates (cuad, legacy),
+        # "cross" = global cross-document candidates from the coarse centroids
+        # (hotpot multi-hop), "distractor" = this query's own ~10 context
+        # paragraphs (HotpotQA distractor setting). hotpot defaults to "cross"
+        # unless the caller explicitly asked for "distractor".
+        rs = (retrieval_scope or "intra").lower()
+        if rs not in ("intra", "cross", "distractor"):
+            rs = "intra"
+        if self.domain_mode == "hotpot" and rs != "distractor":
+            rs = "cross"
+        self.retrieval_scope = rs
+        # Per-query candidate paragraph pool (distractor scope only). Set by the
+        # eval loop before each run_pipeline call; None for intra/cross paths.
+        self._active_candidate_pool: Optional[set] = None
         self.log_facets = log_facets
         self.verbose = verbose
 
@@ -88,6 +117,15 @@ class L2RAGOnlinePipeline:
         self.mmr_lambda = mmr_lambda
         # Fraction of buffer_top_k reserved as pure-L2 anchors before MMR competes for the rest.
         self.gamma = float(max(0.0, min(1.0, gamma)))
+        # ANCHOR PROTECTION. Number of candidates immediately BELOW the gamma anchors,
+        # by query-relevance rank, that are exempt from the tau_dup dedup gate. They
+        # still compete on the full MMR score (relevance + diversity) for an MMR slot --
+        # this only stops a highly relevant chunk from being discarded outright for
+        # resembling something already selected, which is how MMR was dropping gold
+        # second-hop paragraphs that L2 kept. Uses ONLY the query-document relevance
+        # ranking, which gamma already uses; no labels, no gold, available at inference.
+        # 0 = disabled = byte-identical to the previous behaviour.
+        self.anchor_protect_n = max(0, int(anchor_protect_n))
         # 동일 section_heading 후보는 더 가깝게(중복으로) 보이도록 거리 축소 가중치
         self.section_penalty_weight = max(float(section_penalty_weight), 1e-9)
 
@@ -106,6 +144,10 @@ class L2RAGOnlinePipeline:
             fk = float(device_scale_k)
             if np.isfinite(fk) and fk > 0.0:
                 self.device_scale_k = fk
+        # Per-query spread-matching of the MMR diversity term to the relevance
+        # term (analog device path only). Rank/shape preserving; corrects the
+        # analog distance's compressed dynamic range so diversity is not swamped.
+        self.mmr_standardize_terms: bool = bool(standardize_mmr_terms)
 
         # 임베딩 차원 추론 (centroids 또는 LUT 기반)
         self.embedding_dim = 0
@@ -137,6 +179,10 @@ class L2RAGOnlinePipeline:
 
         # 검색 품질 분석용 (마지막 쿼리 결과)
         self._last_summary: Optional[Dict[str, Any]] = None
+        # Array-access counters for the IGZO (MMR) tier, reset per step5 call.
+        # Pure instrumentation: never read by the retrieval logic.
+        self._n_readout_main: int = 0
+        self._n_readout_calib: int = 0
         self._last_latency_ms: Optional[Dict[str, float]] = None
         # Last MMR centroid-filter vs full-doc chunk coverage (set in run_pipeline when verbose)
         self._last_centroid_filter_stats: Optional[Dict[str, Any]] = None
@@ -551,10 +597,62 @@ class L2RAGOnlinePipeline:
             return s if s else None
 
         seen_chunk_ids: set = set()
-        want = str(target_doc_id).strip()
         local_cands: List[Dict[str, Any]] = []
         centroid_ids_set = set(centroid_ids) if centroid_ids is not None else None
 
+        # Distractor scope (HotpotQA standard): candidates are exactly this query's
+        # own ~10 context paragraphs (gold + distractors). Union the intra-doc
+        # inverse index over every paragraph index in the active pool. No centroid
+        # filter — every pool paragraph must be a candidate.
+        if self.retrieval_scope == "distractor":
+            pool = self._active_candidate_pool
+            if not pool:
+                return []
+            for pid in pool:
+                try:
+                    key = str(int(pid))
+                except (TypeError, ValueError):
+                    continue
+                for cid, entry in self.doc_to_pq_entries.get(key, []):
+                    ch = entry.get("chunk_id")
+                    if ch is None or ch in seen_chunk_ids:
+                        continue
+                    cand = _entry_to_candidate(int(cid), entry)
+                    if cand:
+                        local_cands.append(cand)
+                        seen_chunk_ids.add(ch)
+            return local_cands
+
+        # Cross-document scope (hotpot multi-hop): draw candidates from the whole
+        # corpus via the posting lists of the coarse centroids (reuse step3's
+        # global centroid_results). No target_doc_id filter. If centroid_ids is
+        # None (centroid filter off), scan every posting list.
+        if self.retrieval_scope == "cross":
+            if not isinstance(self.pq_codes, dict):
+                return []
+            if centroid_ids is not None:
+                cids_iter: List[int] = [int(c) for c in centroid_ids]
+            else:
+                cids_iter = [int(c) for c in self.pq_codes.keys()]
+            for cid in cids_iter:
+                entries = self.pq_codes.get(cid)
+                if entries is None:
+                    entries = self.pq_codes.get(str(cid))
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    ch = entry.get("chunk_id")
+                    if ch is None or ch in seen_chunk_ids:
+                        continue
+                    cand = _entry_to_candidate(int(cid), entry)
+                    if cand:
+                        local_cands.append(cand)
+                        seen_chunk_ids.add(ch)
+            return local_cands
+
+        want = str(target_doc_id).strip()
         if not want:
             return [] # In intra-doc mode, target_doc_id is mandatory
 
@@ -633,6 +731,95 @@ class L2RAGOnlinePipeline:
         emb = np.asarray(c.get("embedding"), dtype=np.float32)
         return ("emb_bytes", hash(emb.tobytes()))
 
+    def _mmr_diversity_core(
+        self,
+        scored: List[Tuple[Dict, float]],
+        apply_k: bool,
+        k_val: float,
+    ) -> Tuple[float, float, float]:
+        """Per-query diversity statistics from a SINGLE candidate→candidate pass.
+
+        Samples up to 32 candidates and, for each, the min device distance to the
+        others (``k_val``-scaled when ``apply_k``) — the same ``mins`` distribution
+        used for both the score rescale and the z-standardized tau gate. Computed
+        once here so callers never trigger a second ``pair_matrix`` pass.
+
+        Returns ``(div_scale, md_mean, md_std)``:
+          - ``div_scale = dqc_std / md_std`` (spread-match for the SCORE term).
+          - ``md_mean`` / ``md_std`` = mean/std of the ``mins`` distribution
+            (for the z-standardized tau GATE).
+        Returns the sentinel ``(1.0, 0.0, 0.0)`` — meaning "no standardization" —
+        for the software-L2 path, when standardization is disabled, on small pools
+        (< 4), too few valid samples (< 2), or non-finite/degenerate spread.
+        """
+        if (
+            self.device_distance is None
+            or not self.mmr_standardize_terms
+            or len(scored) < 4
+        ):
+            return (1.0, 0.0, 0.0)
+        dqc = np.asarray([d for _, d in scored], dtype=np.float64)
+        dqc_std = float(np.std(dqc))
+        embs = np.stack(
+            [np.asarray(c["embedding"], dtype=np.float32) for c, _ in scored[:32]],
+            axis=0,
+        )
+        mins: List[float] = []
+        for i in range(len(embs)):
+            others = np.delete(embs, i, axis=0)
+            if others.shape[0] == 0:
+                continue
+            dd = self.device_distance.pair_matrix(
+                embs[i : i + 1].astype(np.float64), others.astype(np.float64)
+            )[0]
+            self._n_readout_calib += 1
+            if apply_k:
+                dd = k_val * dd
+            dd = dd[np.isfinite(dd)]
+            if dd.size == 0:
+                continue
+            mins.append(float(np.min(dd)))
+        if len(mins) < 2:
+            return (1.0, 0.0, 0.0)
+        mins_arr = np.asarray(mins, dtype=np.float64)
+        md_mean = float(np.mean(mins_arr))
+        md_std = float(np.std(mins_arr))
+        div_scale = 1.0
+        if np.isfinite(dqc_std) and np.isfinite(md_std) and md_std > 1e-12:
+            div_scale = dqc_std / md_std
+        if not np.isfinite(md_mean) or not np.isfinite(md_std) or md_std <= 1e-12:
+            md_mean, md_std = 0.0, 0.0
+        return (div_scale, md_mean, md_std)
+
+    def _mmr_diversity_scale(
+        self,
+        scored: List[Tuple[Dict, float]],
+        apply_k: bool,
+        k_val: float,
+    ) -> float:
+        """Per-query linear factor matching the diversity term's spread to the
+        relevance term's spread (analog device path only; ``1.0`` otherwise).
+
+        Positive scalar multiply → rank order of candidates preserved. Thin
+        wrapper over :meth:`_mmr_diversity_core` (see it for guard conditions).
+        """
+        return self._mmr_diversity_core(scored, apply_k, k_val)[0]
+
+    def _mmr_diversity_stats(
+        self,
+        scored: List[Tuple[Dict, float]],
+        apply_k: bool,
+        k_val: float,
+    ) -> Tuple[float, float]:
+        """Per-query ``(md_mean, md_std)`` of the candidate→candidate min device
+        distance, used to z-standardize the tau dedup gate.
+
+        Returns the sentinel ``(0.0, 0.0)`` ("standardization disabled") for the
+        software-L2 path or any degenerate case (see :meth:`_mmr_diversity_core`).
+        """
+        _div_scale, md_mean, md_std = self._mmr_diversity_core(scored, apply_k, k_val)
+        return (md_mean, md_std)
+
     def step5_on_the_fly_mmr(
         self,
         query_emb: np.ndarray,
@@ -656,11 +843,23 @@ class L2RAGOnlinePipeline:
         existing_anchors: if provided, keep anchors fixed and stream all candidates only through MMR loop.
         """
         buf_k = self.top_k if buffer_top_k is None else buffer_top_k
+        self._n_readout_main = 0
+        self._n_readout_calib = 0
+        # Write/reject bookkeeping for the IGZO buffer (instrumentation only).
+        ws: Dict[str, int] = {
+            "n_stream_main": 0,
+            "n_stream_fallback": 0,
+            "n_reject_tau": 0,
+            "n_reject_score": 0,
+            "n_write_append": 0,
+            "n_write_replace": 0,
+        }
         if buf_k <= 0:
             return [], {
                 "early_dedup_count": 0,
                 "min_dists_accepted": [],
                 "coverage_met_at_step": None,
+                "write_stats": None,
             }
         mmr_lambda_eff = float(self.mmr_lambda)
         tau_thresh = float(self.tau_dup)
@@ -698,6 +897,18 @@ class L2RAGOnlinePipeline:
                 )
         scored.sort(key=lambda x: x[1])
 
+        # Per-query diversity stats (single candidate→candidate pass):
+        #  - div_scale rescales the SCORE diversity term so its spread equals the
+        #    software-L2 relevance term's (the analog distance is ~9x compressed;
+        #    otherwise diversity is swamped in the weighted MMR sum).
+        #  - (md_mean, md_std) z-standardize the tau dedup GATE below, so tau_dup
+        #    acts in std units and can finely separate redundant vs distinct even
+        #    though the raw analog distances bunch tightly.
+        # Both preserve rank order (monotone in the raw diversity distance);
+        # analog path only (software path -> div_scale=1.0, standardize_tau=False).
+        div_scale, md_mean, md_std = self._mmr_diversity_core(scored, apply_k, k_val)
+        standardize_tau = md_std > 1e-12
+
         early_dedup_count = 0
         skipped_for_dedup: List[Tuple[Dict, float]] = []
 
@@ -732,6 +943,7 @@ class L2RAGOnlinePipeline:
                 raw = np.linalg.norm(
                     selected_embs - cand_emb[None, :], axis=1
                 ).astype(np.float32)
+            self._n_readout_main += 1
 
             # Section-heading penalty applies ONLY to min, not to raw array (preserves dump semantics).
             # Sign-safe: same heading ⇒ treat as closer. For positive distances subtract an
@@ -792,6 +1004,7 @@ class L2RAGOnlinePipeline:
             mmr_slots = buf_k - anchor_count
             mmr_buffer: List[Dict] = []
             mmr_stream = scored[anchor_count:]
+            stream_rank_offset = anchor_count
         else:
             anchor_entries = [dict(x) for x in (existing_anchors or [])]
             anchor_count = len(anchor_entries)
@@ -805,12 +1018,15 @@ class L2RAGOnlinePipeline:
             if len(mmr_buffer) > mmr_slots:
                 mmr_buffer = mmr_buffer[:mmr_slots]
             mmr_stream = scored
+            # Anchors were fixed by a previous round, so this stream starts at rank 0.
+            stream_rank_offset = 0
         coverage_met_at_step: Optional[int] = None
 
         if mmr_slots > 0:
             step_idx = 0
             for cand, dist_q_c in mmr_stream:
                 step_idx += 1
+                ws["n_stream_main"] += 1
                 cand_heading = _section_heading_of(cand)
                 pair_dists_raw, selected_embs, min_dist_c_s = _pair_distances_single_readout(
                     cand_emb=np.asarray(cand["embedding"], dtype=np.float32),
@@ -818,10 +1034,27 @@ class L2RAGOnlinePipeline:
                     cand_heading=cand_heading,
                 )
                 min_dist_raw = float(np.min(pair_dists_raw)) if pair_dists_raw.size > 0 else float("inf")
-                md_for_tau = float(k_val * float(min_dist_c_s)) if apply_k else float(min_dist_c_s)
+                md_for_tau_raw = float(k_val * float(min_dist_c_s)) if apply_k else float(min_dist_c_s)
+                # z-standardize the gate when analog standardization is on: express
+                # the candidate's min diversity distance in per-query std units
+                # (0 = mean candidate distance, -1 = one std more similar). This
+                # gives tau_dup fine-grained control despite the compressed raw
+                # scale. Raw value is preserved below for dumps/provenance.
+                md_for_tau = (
+                    (md_for_tau_raw - md_mean) / md_std
+                    if standardize_tau
+                    else md_for_tau_raw
+                )
 
-                if md_for_tau < tau_thresh:
+                # Anchor protection: the top (anchor_count + anchor_protect_n) candidates
+                # by relevance bypass the dedup gate. They still go through the MMR score
+                # below and must earn their slot.
+                global_rank = stream_rank_offset + step_idx - 1
+                dedup_protected = global_rank < (anchor_count + self.anchor_protect_n)
+
+                if md_for_tau < tau_thresh and not dedup_protected:
                     early_dedup_count += 1
+                    ws["n_reject_tau"] += 1
                     skipped_for_dedup.append((cand, dist_q_c))
                     if self._dump_enabled:
                         self._dump_records["mmr_steps"].append(
@@ -849,7 +1082,9 @@ class L2RAGOnlinePipeline:
                         )
                     continue
 
-                md_for_score = float(k_val * float(min_dist_c_s)) if apply_k else float(min_dist_c_s)
+                md_for_score = (
+                    float(k_val * float(min_dist_c_s)) if apply_k else float(min_dist_c_s)
+                ) * div_scale
                 mmr_score = -mmr_lambda_eff * dist_q_c + (1.0 - mmr_lambda_eff) * md_for_score
                 if not np.isfinite(mmr_score):
                     mmr_score = -mmr_lambda_eff * dist_q_c
@@ -858,6 +1093,7 @@ class L2RAGOnlinePipeline:
                     cand, dist_q_c, min_dist_c_s, mmr_score, method="MMR"
                 )
                 inserted, sticky_event = self._sticky_buffer_try_insert(mmr_buffer, entry, mmr_slots)
+                _ws_count(ws, sticky_event)
                 step_rec: Optional[Dict[str, Any]] = None
                 if self._dump_enabled:
                     step_rec = {
@@ -907,9 +1143,11 @@ class L2RAGOnlinePipeline:
                     if len(mmr_buffer) >= mmr_slots:
                         break
                     step_idx += 1
+                    ws["n_stream_fallback"] += 1
                     score = -mmr_lambda_eff * d_sw
                     entry = _make_entry(cand, d_sw, 0.0, score, method="MMR")
                     inserted, sticky_event = self._sticky_buffer_try_insert(mmr_buffer, entry, mmr_slots)
+                    _ws_count(ws, sticky_event)
                     cand_heading_fb = _section_heading_of(cand)
                     pair_dists_raw, selected_embs, _ = _pair_distances_single_readout(
                         cand_emb=np.asarray(cand["embedding"], dtype=np.float32),
@@ -964,10 +1202,37 @@ class L2RAGOnlinePipeline:
         ]
 
 
+        n_streamed = ws["n_stream_main"] + ws["n_stream_fallback"]
+        writes_mmr = ws["n_write_append"] + ws["n_write_replace"]
+        write_stats: Dict[str, Any] = {
+            # pool / buffer geometry
+            "n_pool": int(len(scored)),
+            "n_anchor": int(anchor_count),
+            "mmr_slots": int(mmr_slots),
+            "n_stream_avail": int(len(mmr_stream)),
+            "buffer_rows_final": int(len(final_out)),
+            # stream accounting (every streamed candidate ends in exactly one bin)
+            "n_streamed": int(n_streamed),
+            "n_stream_main": int(ws["n_stream_main"]),
+            "n_stream_fallback": int(ws["n_stream_fallback"]),
+            "n_reject_tau": int(ws["n_reject_tau"]),
+            "n_reject_score": int(ws["n_reject_score"]),
+            "n_write_append": int(ws["n_write_append"]),
+            "n_write_replace": int(ws["n_write_replace"]),
+            # array writes: anchors are written once unconditionally
+            "writes_mmr": int(writes_mmr),
+            "writes_total": int(anchor_count + writes_mmr),
+            # array readouts (one pair_matrix call == one match-line readout)
+            "n_readout_main": int(self._n_readout_main),
+            "n_readout_calib": int(self._n_readout_calib),
+            "n_readout_total": int(self._n_readout_main + self._n_readout_calib),
+            "standardize_active": bool(standardize_tau),
+        }
         stats = {
             "early_dedup_count": early_dedup_count,
             "min_dists_accepted": min_dists_accepted,
             "coverage_met_at_step": coverage_met_at_step,
+            "write_stats": write_stats,
         }
         return final_out, stats
     
@@ -1487,6 +1752,7 @@ class L2RAGOnlinePipeline:
             min_dists_accepted=stats.get("min_dists_accepted", []),
             nprobe_used=max(len(centroid_results), 1)
         )
+        summary["write_stats"] = stats.get("write_stats")
         if self.min_mmr_score is not None:
             coverage_summary = stats.get("coverage_met_at_step") is not None
             if not coverage_summary:
@@ -1635,14 +1901,56 @@ def load_dataset_for_domain(
     domain: str,
     split: str = "train",
     max_contexts: Optional[int] = None,
-) -> Tuple[List[str], List[Tuple[str, int, Optional[str], Optional[str]]]]:
+) -> Tuple[List[str], List[Tuple[str, int, Optional[str], Optional[str], Optional[List[int]], Optional[List[int]]]]]:
     """
     로컬 processed_cuad/cuad_corpus.json, cuad_queries.json에서
-    인덱싱용 문맥과 평가용 (question, ref_doc_id, answers_text, query_concat) 로드.
+    인덱싱용 문맥과 평가용 (question, ref_doc_id, answers_text, query_concat, gold_support, candidate_pool) 로드.
+
+    domain='hotpot'이면 processed_hotpot/*.json을 읽고 각 쿼리에 gold_support
+    (List[int] 코퍼스 문단 인덱스)와 candidate_pool(해당 질문의 context 문단 인덱스,
+    distractor scope용)을 실어 반환한다. cuad는 둘 다 None(기존 동작 유지).
     """
     _ = split  # API 호환용 (미사용)
-    if domain.lower() != "cuad":
-        raise ValueError(f"이 모듈은 CUAD 전용입니다. domain='cuad'만 허용됩니다. 입력: {domain!r}")
+    domain_l = domain.lower()
+    if domain_l not in ("cuad", "hotpot"):
+        raise ValueError(
+            f"이 모듈은 CUAD/HotpotQA 전용입니다. domain in ('cuad','hotpot')만 허용됩니다. 입력: {domain!r}"
+        )
+
+    if domain_l == "hotpot":
+        corpus_path = os.path.join(".", "processed_hotpot", "hotpot_corpus.json")
+        queries_path = os.path.join(".", "processed_hotpot", "hotpot_queries.json")
+        if not os.path.isfile(corpus_path):
+            raise FileNotFoundError(
+                f"HotpotQA 코퍼스 파일이 없습니다: {corpus_path}. preprocess_hotpot.py를 먼저 실행하세요."
+            )
+        if not os.path.isfile(queries_path):
+            raise FileNotFoundError(
+                f"HotpotQA 쿼리 파일이 없습니다: {queries_path}. preprocess_hotpot.py를 먼저 실행하세요."
+            )
+        with open(corpus_path, "r", encoding="utf-8") as f:
+            contexts = json.load(f)
+        with open(queries_path, "r", encoding="utf-8") as f:
+            queries_raw = json.load(f)
+        eval_pairs = [
+            (
+                item["query"],
+                int(item.get("ref_doc_id", (item.get("gold_support") or [0])[0])),
+                item.get("answers", ""),
+                item.get("query_concat"),
+                [int(g) for g in (item.get("gold_support") or [])],
+                [int(x) for x in (item.get("candidate_pool") or [])],
+            )
+            for item in queries_raw
+        ]
+        if max_contexts is not None and max_contexts > 0:
+            contexts = contexts[:max_contexts]
+            eval_pairs = [
+                (q, ref_id, ans, q_concat, gold, pool)
+                for (q, ref_id, ans, q_concat, gold, pool) in eval_pairs
+                if all(g < len(contexts) for g in (gold or [ref_id]))
+            ]
+        return contexts, eval_pairs
 
     corpus_path = os.path.join(".", "processed_cuad", "cuad_corpus.json")
     queries_path = os.path.join(".", "processed_cuad", "cuad_queries.json")
@@ -1660,14 +1968,16 @@ def load_dataset_for_domain(
             int(item["ref_doc_id"]),
             item.get("answers", ""),
             item.get("query_concat"),
+            None,  # gold_support: cuad는 단일 정답 문서 → None (기존 동작 유지)
+            None,  # candidate_pool: cuad는 distractor scope 미사용 → None
         )
         for item in queries_raw
     ]
     if max_contexts is not None and max_contexts > 0:
         contexts = contexts[:max_contexts]
         eval_pairs = [
-            (q, ref_id, ans, q_concat)
-            for (q, ref_id, ans, q_concat) in eval_pairs
+            (q, ref_id, ans, q_concat, gold, pool)
+            for (q, ref_id, ans, q_concat, gold, pool) in eval_pairs
             if ref_id < len(contexts)
         ]
     return contexts, eval_pairs
@@ -2006,6 +2316,28 @@ def _redundancy_rate_from_embeddings(
     return redundant_pairs / float(valid_pairs)
 
 
+def _retrieved_parent_doc_ids(results: List[Dict[str, Any]]) -> List[int]:
+    """Ranked list of each selected chunk's PARENT corpus-paragraph index.
+
+    For hotpot the offline indexer stores ``metadata.doc_id = str(paragraph
+    index in hotpot_corpus.json)`` (Invariant 1), so ``int(doc_id)`` recovers the
+    parent paragraph index that supporting-passage recall compares to
+    ``gold_support``. Rank order follows the final per-arm buffer order.
+    Duplicates are kept (several chunks may share one parent paragraph).
+    """
+    out: List[int] = []
+    for doc in results or []:
+        meta = doc.get("metadata") if isinstance(doc, dict) else None
+        did = (meta or {}).get("doc_id") if isinstance(meta, dict) else None
+        if did is None:
+            continue
+        try:
+            out.append(int(str(did).strip()))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def build_normalized_retrieval_record(
     *,
     query_idx: int,
@@ -2027,6 +2359,9 @@ def build_normalized_retrieval_record(
     gamma: float,
     l2_raw_contexts: Optional[List[str]] = None,
     l2_raw_chunk_lut: Optional[List[Dict[str, Any]]] = None,
+    gold_support: Optional[List[int]] = None,
+    l2_doc_ids: Optional[List[int]] = None,
+    mmr_doc_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Build one canonical retrieval record for downstream evaluation."""
     return {
@@ -2035,10 +2370,13 @@ def build_normalized_retrieval_record(
         "rewritten_query": None,
         "ground_truth": str(ground_truth or ""),
         "aspect_queries": [str(x) for x in (aspect_queries or [])],
+        # Multi-hop supporting-passage recall (hotpot). None for cuad → eval skips.
+        "gold_support": None if gold_support is None else [int(g) for g in gold_support],
         "retrieval": {
             "l2": {
                 "contexts": list(l2_contexts or []),
                 "chunk_lut": list(l2_chunk_lut or []),
+                "retrieved_doc_ids": None if l2_doc_ids is None else [int(x) for x in l2_doc_ids],
             },
             "l2_raw": {
                 "contexts": list(l2_raw_contexts or []),
@@ -2047,6 +2385,7 @@ def build_normalized_retrieval_record(
             "mmr": {
                 "contexts": list(mmr_contexts or []),
                 "chunk_lut": list(mmr_chunk_lut or []),
+                "retrieved_doc_ids": None if mmr_doc_ids is None else [int(x) for x in mmr_doc_ids],
             },
         },
         "generation": {
@@ -2138,6 +2477,8 @@ def _configure_device_distance(
     noise_seed: Optional[int],
     device_scale_k_path: Optional[str] = None,
     device_scale_k_override: Optional[float] = None,
+    device_v_min: Optional[float] = None,
+    device_v_max: Optional[float] = None,
 ) -> Tuple["DeviceDistance", Optional[float]]:
     import hashlib
 
@@ -2219,6 +2560,13 @@ def _configure_device_distance(
         _fit_scaler(dd)
     else:
         print(f"[Device-L2] using existing scaler at {scaler_abs}.")
+    # Operating voltage window for the MMR device path. Applied AFTER scaler
+    # fit/save so the shared on-disk scaler keeps its own window; only the
+    # in-memory object is retargeted. Widening [-1,1] -> [-3,3] grows the analog
+    # distance's dynamic range ~2.5x (still within the measured range).
+    if device_v_min is not None and device_v_max is not None:
+        dd.v_min = float(device_v_min)
+        dd.v_max = float(device_v_max)
     ne = bool(dd.noise.enabled())
     print(
         "[Device-L2] analytical backend: "
@@ -2277,6 +2625,30 @@ def _configure_device_distance(
             f"[Device-L2] loaded scale_k from {kp}: k={k_val:.6g} "
             f"(ratio p5={rs.get('p5', 'NA')}, p95={rs.get('p95', 'NA')})"
         )
+        # Warn if the scale_k was calibrated at a different operating window than
+        # the one this device now runs at. tau_dup lives on the scale_k scale, so
+        # a window mismatch makes the tau_dup gate meaningless until re-tuned.
+        # (Change 1's per-query div_scale still rebalances the diversity spread.)
+        k_vmin = kdata.get("v_min")
+        k_vmax = kdata.get("v_max")
+        if k_vmin is not None and k_vmax is not None:
+            if (
+                abs(float(k_vmin) - dd.v_min) > 1e-9
+                or abs(float(k_vmax) - dd.v_max) > 1e-9
+            ):
+                print(
+                    f"[Device-L2] WARNING: scale_k calibrated at window "
+                    f"[{float(k_vmin):g}, {float(k_vmax):g}] but device runs at "
+                    f"[{dd.v_min:g}, {dd.v_max:g}]. Re-run scripts/calibrate_scale_k.py "
+                    f"--v_min {dd.v_min:g} --v_max {dd.v_max:g} and re-tune tau_dup."
+                )
+        elif abs(dd.v_min + 1.0) > 1e-9 or abs(dd.v_max - 1.0) > 1e-9:
+            print(
+                f"[Device-L2] WARNING: scale_k JSON has no window record and the "
+                f"device runs at [{dd.v_min:g}, {dd.v_max:g}] (not [-1, 1]). scale_k "
+                f"may be stale for this window; re-calibrate and re-tune tau_dup "
+                f"(per-query div_scale still rebalances the diversity spread)."
+            )
     if k_val is not None:
         print(
             f"[Device-L2] calibration: k={k_val:.6g}. "
@@ -2302,12 +2674,14 @@ def run_mmr_evaluation(
     tau_dup: float = 0.5,
     mmr_lambda: float = 0.85,
     gamma: float = 0.25,
+    anchor_protect_n: int = 0,
     verbose: bool = True,
     show_docs: bool = False,
     export_normalized_json: Optional[str] = None,
     target_doc_id: Optional[str] = None,
     window_size: int = 1,
     retrieval_mode: str = "COMPARE",
+    retrieval_scope: str = "intra",
     dump_embeddings: bool = False,
     dump_dir: str = "./emb_dump",
     dump_tag: str = "q0",
@@ -2325,6 +2699,9 @@ def run_mmr_evaluation(
     noise_seed: Optional[int] = None,
     device_scale_k_path: Optional[str] = None,
     device_scale_k: Optional[float] = None,
+    device_v_min: float = -3.0,
+    device_v_max: float = 3.0,
+    standardize_mmr_terms: bool = True,
     use_centroid_device_distance: bool = False,
     centroid_fit_path: str = "",
     centroid_scaler_path: Optional[str] = None,
@@ -2391,6 +2768,8 @@ def run_mmr_evaluation(
             noise_seed=noise_seed,
             device_scale_k_path=device_scale_k_path,
             device_scale_k_override=device_scale_k,
+            device_v_min=device_v_min,
+            device_v_max=device_v_max,
         )
     centroid_dd = None
     if use_centroid_device_distance:
@@ -2520,6 +2899,14 @@ def run_mmr_evaluation(
         else:
             print("  Noise:      disabled (deterministic)")
         print("=" * 68)
+    # Retrieval scope: hotpot forces cross-document candidate loading unless the
+    # caller explicitly asked for "distractor" (per-query ~10-paragraph pool);
+    # cuad stays intra (single target-doc) so its behavior is byte-for-byte
+    # unchanged.
+    if domain.lower() == "hotpot":
+        effective_scope = "distractor" if (retrieval_scope or "").lower() == "distractor" else "cross"
+    else:
+        effective_scope = retrieval_scope or "intra"
     pipeline = L2RAGOnlinePipeline(
         hw_state,
         domain_mode=domain,
@@ -2529,6 +2916,7 @@ def run_mmr_evaluation(
         tau_dup=tau_dup,
         mmr_lambda=mmr_lambda,
         gamma=gamma,
+        anchor_protect_n=anchor_protect_n,
         verbose=verbose,
         dump_embeddings=dump_embeddings,
         dump_dir=dump_dir,
@@ -2539,6 +2927,8 @@ def run_mmr_evaluation(
         device_distance=device_dd,
         centroid_device_distance=centroid_dd,
         device_scale_k=device_scale_k_val,
+        standardize_mmr_terms=standardize_mmr_terms,
+        retrieval_scope=effective_scope,
     )
     doc_chunk_text_index = _build_doc_chunk_text_index(pipeline.metadata_sram or {})
     
@@ -2639,13 +3029,24 @@ def run_mmr_evaluation(
 
     centroid_filter_mmr_samples: List[Dict[str, Any]] = []
 
-    for idx, (question, ref_doc_id, answers_text, query_concat) in enumerate(eval_pairs):
+    for idx, (question, ref_doc_id, answers_text, query_concat, gold_support, candidate_pool) in enumerate(eval_pairs):
         if dump_embeddings:
             pipeline._dump_reset()
             pipeline._dump_tag = f"{dump_tag}_q{idx}"
-        current_target = (
-            str(ref_doc_id) if ref_doc_id is not None else target_doc_id
+        # Distractor scope: restrict step4 to this query's own ~10 context
+        # paragraphs (gold + distractors). None for intra/cross paths.
+        pipeline._active_candidate_pool = (
+            set(candidate_pool) if (effective_scope == "distractor" and candidate_pool) else None
         )
+        # Cross-doc (hotpot) and distractor both draw from multiple documents; do
+        # not pin the query to a single target document (step4 ignores
+        # target_doc_id in those scopes).
+        if effective_scope in ("cross", "distractor"):
+            current_target = None
+        else:
+            current_target = (
+                str(ref_doc_id) if ref_doc_id is not None else target_doc_id
+            )
         aspect_queries = _extract_aspect_only_queries(query_concat)
         target_id_for_tag = str(current_target).strip() if current_target else None
         if not target_id_for_tag:
@@ -2724,6 +3125,7 @@ def run_mmr_evaluation(
                 metrics_l2_raw.append(routed_summary)
             else:
                 metrics_l2.append(routed_summary)
+            routed_doc_ids = _retrieved_parent_doc_ids(routed_results[: int(top_k)])
             lut_key = "l2_raw" if mode_upper == "L2_RAW" else mode_upper.lower()
             export_data.append({
                 "query": question,
@@ -2734,6 +3136,8 @@ def run_mmr_evaluation(
                 "chunk_lut": {
                     lut_key: routed_lut,
                 },
+                "gold_support": gold_support,
+                "retrieved_doc_ids": {lut_key: routed_doc_ids},
             })
             export_eval_data.append(
                 build_normalized_retrieval_record(
@@ -2756,6 +3160,9 @@ def run_mmr_evaluation(
                     mmr_lambda=mmr_lambda,
                     tau_dup=tau_dup,
                     gamma=gamma,
+                    gold_support=gold_support,
+                    l2_doc_ids=routed_doc_ids if mode_upper == "L2" else None,
+                    mmr_doc_ids=routed_doc_ids if mode_upper == "MMR" else None,
                 )
             )
             if verbose:
@@ -2887,6 +3294,8 @@ def run_mmr_evaluation(
             metrics_l2_raw.append(l2raw_summary)
             metrics_mmr.append(mmr_summary)
 
+            l2_doc_ids = _retrieved_parent_doc_ids(l2_results[: int(top_k)])
+            mmr_doc_ids = _retrieved_parent_doc_ids(mmr_results[: int(top_k)])
             export_data.append({
                 "query": question,
                 "ground_truth": expected_text,
@@ -2898,6 +3307,11 @@ def run_mmr_evaluation(
                     "l2": l2_lut,
                     "l2_raw": l2raw_lut,
                     "mmr": mmr_lut,
+                },
+                "gold_support": gold_support,
+                "retrieved_doc_ids": {
+                    "l2": l2_doc_ids,
+                    "mmr": mmr_doc_ids,
                 },
             })
             export_eval_data.append(
@@ -2921,6 +3335,9 @@ def run_mmr_evaluation(
                     gamma=gamma,
                     l2_raw_contexts=l2raw_stitched,
                     l2_raw_chunk_lut=l2raw_lut,
+                    gold_support=gold_support,
+                    l2_doc_ids=l2_doc_ids,
+                    mmr_doc_ids=mmr_doc_ids,
                 )
             )
             if verbose:
@@ -3064,6 +3481,10 @@ def run_mmr_evaluation(
         def _doc_text(doc: Dict) -> str:
             return (doc.get("metadata") or {}).get("text") or doc.get("text", "") or ""
 
+        # Ranked parent-paragraph indices per arm for supporting-passage recall.
+        l2_doc_ids = _retrieved_parent_doc_ids(l2_results[: int(top_k)])
+        mmr_doc_ids = _retrieved_parent_doc_ids(mmr_results[: int(top_k)])
+
         export_data.append({
             "query": question,
             "ground_truth": expected_text,
@@ -3074,6 +3495,13 @@ def run_mmr_evaluation(
                 "l2": l2_lut,
                 "mmr": mmr_lut,
             },
+            "gold_support": gold_support,
+            "retrieved_doc_ids": {
+                "l2": l2_doc_ids,
+                "mmr": mmr_doc_ids,
+            },
+            # IGZO-tier array access counts for the MMR arm (instrumentation only).
+            "write_stats": mmr_summary.get("write_stats"),
         })
         export_eval_data.append(
             build_normalized_retrieval_record(
@@ -3094,6 +3522,9 @@ def run_mmr_evaluation(
                 mmr_lambda=mmr_lambda,
                 tau_dup=tau_dup,
                 gamma=gamma,
+                gold_support=gold_support,
+                l2_doc_ids=l2_doc_ids,
+                mmr_doc_ids=mmr_doc_ids,
             )
         )
         if verbose:
@@ -3328,7 +3759,7 @@ def run_mmr_evaluation(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Offline indexing + Online MMR evaluation (CUAD)")
-    parser.add_argument("--domain", type=str, default="cuad", choices=["cuad"])
+    parser.add_argument("--domain", type=str, default="cuad", choices=["cuad", "hotpot"])
     parser.add_argument("--mode", type=str, default="eval", choices=["index", "eval", "both"])
     parser.add_argument("--output_dir", type=str, default=".")
     parser.add_argument("--max_docs", type=int, default=2000, help="오프라인 인덱싱 시 최대 문서 수")
@@ -3390,6 +3821,18 @@ if __name__ == "__main__":
             "L2_RAW: raw-embedding L2 (PQ-free upper bound). "
             "COMPARE_ALL: three-way L2 + L2_RAW + MMR. "
             "COMPARE: L2 vs MMR only."
+        ),
+    )
+    parser.add_argument(
+        "--retrieval_scope",
+        type=str,
+        default="intra",
+        choices=["intra", "cross", "distractor"],
+        help=(
+            "Candidate scope: 'intra' = single target-doc (cuad default); "
+            "'cross' = global cross-document from coarse centroids (hotpot multi-hop, "
+            "auto-forced when --domain hotpot); 'distractor' = this query's own ~10 "
+            "context paragraphs (HotpotQA distractor setting)."
         ),
     )
     parser.add_argument(
@@ -3499,6 +3942,26 @@ if __name__ == "__main__":
         help="Override scale_k with a direct float (takes precedence over --device_scale_k_path).",
     )
     parser.add_argument(
+        "--device_v_min",
+        type=float,
+        default=-3.0,
+        help="Analog MMR-path operating voltage window lower bound "
+             "(default -3.0; measured range, ~2.5x wider distance spread vs [-1,1]).",
+    )
+    parser.add_argument(
+        "--device_v_max",
+        type=float,
+        default=3.0,
+        help="Analog MMR-path operating voltage window upper bound (default 3.0).",
+    )
+    parser.add_argument(
+        "--standardize_mmr_terms",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Per-query spread-match the analog MMR diversity term to the relevance "
+             "term (default on; analog path only, rank/shape preserving).",
+    )
+    parser.add_argument(
         "--use_centroid_device_distance",
         action="store_true",
         help="step3 cluster centroid L2 uses analytical NVM (FeFET) device model.",
@@ -3571,6 +4034,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mode in ("index", "both"):
+        if args.domain == "hotpot":
+            raise SystemExit(
+                "hotpot 인덱싱은 이 CLI가 아니라 off_line_prepper.py로 수행하세요: "
+                "python off_line_prepper.py --domain hotpot"
+            )
         print(f"[Offline] 도메인 '{args.domain}' 인덱싱 시작 (max_docs={args.max_docs})...")
         save_dir = run_offline_indexing_for_domain(
             args.domain,
@@ -3588,7 +4056,8 @@ if __name__ == "__main__":
             args.domain,
             offline_data_dir=os.path.join(args.output_dir, f"offline_data_{args.domain}"),
             num_queries=args.num_queries,
-            max_contexts=args.max_docs,
+            # hotpot: never cap the corpus (would break gold_support alignment).
+            max_contexts=None if args.domain == "hotpot" else args.max_docs,
             top_k=args.top_k,
             nprobe=args.nprobe,
             top_r=args.top_r,
@@ -3601,6 +4070,7 @@ if __name__ == "__main__":
             export_normalized_json=args.export_normalized_json,
             target_doc_id=args.target_doc_id,
             retrieval_mode=args.retrieval_mode,
+            retrieval_scope=args.retrieval_scope,
             dump_embeddings=args.dump_embeddings,
             dump_dir=args.dump_dir,
             dump_tag=args.dump_tag,
@@ -3618,6 +4088,9 @@ if __name__ == "__main__":
             noise_seed=args.noise_seed,
             device_scale_k_path=args.device_scale_k_path,
             device_scale_k=args.device_scale_k,
+            device_v_min=float(args.device_v_min),
+            device_v_max=float(args.device_v_max),
+            standardize_mmr_terms=bool(args.standardize_mmr_terms),
             use_centroid_device_distance=bool(args.use_centroid_device_distance),
             centroid_fit_path=str(args.centroid_fit_path or ""),
             centroid_scaler_path=args.centroid_scaler_path,

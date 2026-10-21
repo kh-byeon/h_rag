@@ -1,0 +1,7 @@
+{
+  "sigma_vth": 0.03,
+  "sigma_log_mu": 0.05,
+  "retention_tau": 10.0,
+  "t_hold": 0.01,
+  "rng_seed": 42
+}

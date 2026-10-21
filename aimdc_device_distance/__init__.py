@@ -119,6 +119,8 @@ class DeviceDistance:
         eps: float = 1e-15,
         v_ml: float = 0.0,
         noise: Optional[NoiseModel] = None,
+        v_min: Optional[float] = None,
+        v_max: Optional[float] = None,
     ) -> None:
         self.fit_json_path = os.path.abspath(fit_json_path)
         self.fit_sha256 = _sha256_file(self.fit_json_path)
@@ -156,6 +158,13 @@ class DeviceDistance:
                 # Missing/corrupt/stale (fit_sha256 mismatch) → leave unset for re-fit.
                 self._x_lo = None
                 self._x_hi = None
+        # Explicit operating-window overrides win over both circuit_params and the
+        # scaler's stored window (load_scaler above may have overwritten them).
+        # Default None keeps the fit/scaler-derived window (byte-for-byte).
+        if v_min is not None:
+            self.v_min = float(v_min)
+        if v_max is not None:
+            self.v_max = float(v_max)
 
     def reset_rng(self, seed: Optional[int]) -> None:
         self._rng = np.random.default_rng(seed)

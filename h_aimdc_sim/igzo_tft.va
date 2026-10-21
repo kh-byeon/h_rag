@@ -1,0 +1,28 @@
+`include "/opt/va-std/disciplines.vams"
+`include "/opt/va-std/constants.vams"
+
+module igzo_tft(d, g, s);
+    inout d, g, s;
+    electrical d, g, s;
+    real vgs, vds, log_ids;
+
+    analog begin
+        vgs = V(g, s);
+        vds = V(d, s);
+        
+        // OpenVAF의 재할당/If문 버그를 피하기 위한 단일 수식 처리
+        log_ids = (-9.289339e+00)
+            + (1.591735e+00) * vgs
+            + (-3.523506e-01) * vds
+            + (6.397666e-02) * vgs * vgs
+            + (2.246270e-01) * vgs * vds
+            + (5.413483e-01) * vds * vds
+            + (-6.796205e-02) * vgs * vgs * vgs
+            + (1.463180e-02) * vgs * vgs * vds
+            + (8.791619e-02) * vgs * vds * vds
+            + (6.307181e-01) * vds * vds * vds;
+        
+        // 전류 방향 (Drain -> Source), pow() 대신 exp() 사용
+        I(d, s) <+ exp(2.302585092994046 * log_ids);
+    end
+endmodule

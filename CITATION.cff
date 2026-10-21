@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper and this repository."
+title: "h_rag: H-AIMDC simulation pipeline for diversity-aware edge RAG"
+version: 1.0.0
+date-released: 2026-10-21
+license: MIT
+repository-code: "https://github.com/kh-byeon/h_rag"
+authors:
+  - family-names: Byun
+    given-names: K. Aiden
+    affiliation: "Seoul National University"
+  - family-names: Choi
+    given-names: Hyeong Seok
+    affiliation: "Seoul National University"
+  - family-names: Joe
+    given-names: Changhoon
+    affiliation: "Seoul National University"
+  - family-names: Han
+    given-names: Dong Hee
+    affiliation: "Seoul National University"
+  - family-names: Park
+    given-names: Min Hyuk
+    affiliation: "Seoul National University"
+  - family-names: Kim
+    given-names: Sangbum
+    affiliation: "Seoul National University"
+preferred-citation:
+  type: article
+  title: "Diversity-aware retrieval-augmented generation acceleration at the edge enabled by FeFET-IGZO heterogeneous analog in-memory distance computing"
+  authors:
+    - family-names: Byun
+      given-names: K. Aiden
+    - family-names: Choi
+      given-names: Hyeong Seok
+    - family-names: Joe
+      given-names: Changhoon
+    - family-names: Han
+      given-names: Dong Hee
+    - family-names: Park
+      given-names: Min Hyuk
+    - family-names: Kim
+      given-names: Sangbum
+  year: 2026
+  journal: "(submitted)"

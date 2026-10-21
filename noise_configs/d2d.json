@@ -1,0 +1,5 @@
+{
+  "sigma_vth": 0.03,
+  "sigma_log_mu": 0.05,
+  "rng_seed": 42
+}

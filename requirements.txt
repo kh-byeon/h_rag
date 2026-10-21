@@ -1,11 +1,24 @@
+# Core (retrieval, device models, analysis) -- CPU only
+numpy
+scipy
+pandas
+openpyxl
+matplotlib
+tqdm
+pytest
+
+# Embedding, generation and scoring -- GPU recommended
+torch
 transformers>=4.45.0
 accelerate
 sentencepiece
 bitsandbytes
-pandas
-openpyxl
-tqdm
+sentence-transformers
 datasets
-scipy
-umap-learn
 rouge-score
+
+# Optional
+langchain                  # RecursiveCharacterTextSplitter for clause chunking in off_line_prepper.py (falls back to a plain splitter if absent)
+umap-learn                 # centroid_wordcloud_vis.py
+wordcloud                  # centroid_wordcloud_vis.py
+# vllm                     # 70b_llm_as_a_judge.py only (exploratory, not used for the paper's numbers)

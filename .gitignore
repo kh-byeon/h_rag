@@ -1,18 +1,62 @@
-# Ignore everything by default
+# ---------------------------------------------------------------------------
+# Whitelist: ignore everything, then re-admit source code, configs and docs.
+# Datasets, indexes, model caches, run outputs and generated figures stay local
+# (the per-question results and device data are published in h_aimdc_data).
+# ---------------------------------------------------------------------------
 *
 
-# Keep Python source files
-!*.py
-
-# Keep folders so git can traverse them
+# keep folders so git can traverse them
 !*/
 
-# Optional: keep a few useful text/config files
+# source code
+!*.py
+!*.sh
+!*.js
+
+# configs, docs, packaging
 !.gitignore
 !README.md
-
+!LICENSE
+!CITATION.cff
+!requirements.txt
 !setup.py
 !pyproject.toml
 !*.yaml
 !*.yml
 
+# device models: fitted parameters, measured IGZO transfer curve, SPICE / Verilog-A decks
+!h_aimdc_sim/*.json
+!h_aimdc_sim/igzo_measure.csv
+!h_aimdc_sim/*.sp
+!h_aimdc_sim/*.va
+!h_aimdc_sim/Dockerfile
+!h_aimdc_sim/examples/*
+!noise_configs/*.json
+
+# ---------------------------------------------------------------------------
+# explicit exclusions (override the whitelist above)
+# ---------------------------------------------------------------------------
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.venv/
+*.b64
+*.o[0-9]
+*.osdi
+*.so
+
+# internal working notes, drafts and exploratory outputs
+docs/
+sweep_exports/Claude outputs/
+figures/fig2/_to_delete/
+h_aimdc_sim/outputs_*/
+h_aimdc_sim/my_sim/
+h_aimdc_sim/h_aimdc_sim/
+h_aimdc_sim/test_tmp_scaler.json
+h_aimdc_sim_file_tree.md
+
+# cluster job spec (contains credentials) -- never commit
+eval_run.yaml
+
+# scratch workspace of scripts/run_write_stats*.sh
+ws_q1000/

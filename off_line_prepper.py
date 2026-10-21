@@ -14,12 +14,13 @@ except Exception:
 
 # 도메인별 HuggingFace 임베딩 모델 (online_accelerator DOMAIN_EMBEDDING_MODEL_MAP과 동기화)
 # 벡터 공간·L2 검색용. legal/cuad는 SentenceTransformer로 오프라인 인덱싱과 온라인 검색 일관 유지.
-DOMAIN_MODES = ("general", "legal", "medical", "cuad")
+DOMAIN_MODES = ("general", "legal", "medical", "cuad", "hotpot")
 DOMAIN_MODEL_MAP = {
     "general": "sentence-transformers/all-mpnet-base-v2",
     "legal": "sentence-transformers/all-mpnet-base-v2",
     "medical": "sentence-transformers/multi-qa-mpnet-base-dot-v1",  # 벡터 공간·비대칭 검색
     "cuad": "sentence-transformers/multi-qa-mpnet-base-dot-v1",  # QA 전용 비대칭 검색
+    "hotpot": "sentence-transformers/multi-qa-mpnet-base-dot-v1",  # HotpotQA multi-hop, 비대칭 QA 검색
 }
 
 # 조사된 벤치마크 데이터셋 (Parquet 기반, 로드 실패 시 즉시 예외)
@@ -30,6 +31,7 @@ DOMAIN_DATASET_MAP = {
     "legal": "flowaicom/legalbench_contracts_qa_subset",
     "medical": "pubmed_qa",
     "cuad": "cuad",
+    "hotpot": "hotpot",
 }
 # medical: pubmed_qa는 subset pqa_labeled 사용
 DOMAIN_DATASET_CONFIG = {
@@ -37,6 +39,7 @@ DOMAIN_DATASET_CONFIG = {
     "legal": None,
     "medical": "pqa_labeled",
     "cuad": None,
+    "hotpot": None,
 }
 
 
@@ -71,6 +74,34 @@ def load_dataset_for_domain(
                 queries_raw = json.load(f)
             eval_pairs = [(item["query"], int(item["ref_doc_id"])) for item in queries_raw]
         if max_contexts is not None and max_contexts > 0:
+            contexts = contexts[:max_contexts]
+            eval_pairs = [(q, ref_id) for q, ref_id in eval_pairs if ref_id < len(contexts)]
+        return contexts, eval_pairs
+
+    if domain == "hotpot":
+        # HotpotQA multi-hop. corpus = List[str] (one paragraph per entry),
+        # queries carry gold_support (List[int] corpus indices). The prepper only
+        # needs `contexts` to build the index; eval_pairs mirror cuad's shape and
+        # use ref_doc_id = gold_support[0] (compat only). Invariant 1: the chunk
+        # doc_id MUST equal the source paragraph's index in hotpot_corpus.json —
+        # guaranteed by run_pipeline(doc_ids=[str(i) ...]) + one chunk/paragraph.
+        corpus_path = os.path.join(".", "processed_hotpot", "hotpot_corpus.json")
+        if not os.path.isfile(corpus_path):
+            raise FileNotFoundError(
+                f"HotpotQA 코퍼스가 없습니다: {corpus_path}. preprocess_hotpot.py를 먼저 실행하세요."
+            )
+        with open(corpus_path, "r", encoding="utf-8") as f:
+            contexts = json.load(f)
+        queries_path = os.path.join(".", "processed_hotpot", "hotpot_queries.json")
+        eval_pairs = []
+        if os.path.isfile(queries_path):
+            with open(queries_path, "r", encoding="utf-8") as f:
+                queries_raw = json.load(f)
+            eval_pairs = [(item["query"], int(item.get("ref_doc_id", 0))) for item in queries_raw]
+        if max_contexts is not None and max_contexts > 0:
+            # NOTE: truncating the hotpot corpus breaks gold_support alignment for
+            # queries whose gold paragraphs fall past the cap; callers building the
+            # index for recall eval should pass max_contexts=None.
             contexts = contexts[:max_contexts]
             eval_pairs = [(q, ref_id) for q, ref_id in eval_pairs if ref_id < len(contexts)]
         return contexts, eval_pairs
@@ -215,7 +246,7 @@ class L2RAGOfflineIndexer:
     def __init__(
         self,
         domain_mode: str = "general",
-        num_centroids: int = 1024,
+        num_centroids: int = 128,
         num_subspaces: int = 8,
         output_base_dir: str = ".",
     ):
@@ -273,6 +304,20 @@ class L2RAGOfflineIndexer:
         original_doc_ids_per_doc: List[List[int]] = []
         doc_id_per_clean_doc: List[str] = []
 
+        # hotpot: preserve a strict 1:1 positional mapping between input paragraphs
+        # and clean_docs (no dedup, no empty-skip). Any shift would misalign the
+        # chunk doc_id from the corpus paragraph index and corrupt gold_support.
+        if self.domain_mode == "hotpot":
+            for row_idx, doc in enumerate(raw_documents):
+                cleaned = _clean_text(doc)
+                doc_id = (
+                    raw_doc_ids[row_idx] if raw_doc_ids and row_idx < len(raw_doc_ids) else None
+                ) or f"doc_{row_idx}"
+                clean_docs.append(cleaned)
+                original_doc_ids_per_doc.append([row_idx])
+                doc_id_per_clean_doc.append(doc_id)
+            return clean_docs, original_doc_ids_per_doc, doc_id_per_clean_doc
+
         for row_idx, doc in enumerate(raw_documents):
             cleaned = _clean_text(doc)
             if not cleaned:
@@ -290,61 +335,105 @@ class L2RAGOfflineIndexer:
         return clean_docs, original_doc_ids_per_doc, doc_id_per_clean_doc
 
     # -----------------------------
-    # Legal / CUAD: 조항(Clause) 단위 청킹 보조
+    # Legal / CUAD: 1 chunk = 1 clause (regex clause boundaries, independent chunks)
     # -----------------------------
-    _LEGAL_CLAUSE_BOUNDARY_RE = re.compile(
-        r"(?:\n\n+)"
-        r"|(?:\n(?=Article\b))"
-        r"|(?:\n(?=SECTION\b))"
-        r"|(?:\n(?=Section\b))"
-        r"|(?:\n(?=\d{1,3}\.\d{1,3}(?:\.\d+)?\s))"
+    # Zero-width matches at the start of each clause (works on single-line text after step1 \s+ collapse).
+    # Numbered branch: do not split "Section 12.1 ..." again at 12.1 (lookbehinds are fixed-width).
+    _LEGAL_NUMBERED_CLAUSE_START = (
+        r"(?:^|(?<=\s))"
+        r"(?<!Section\s)(?<!SECTION\s)(?<!Article\s)(?<!Clause\s)"
+        r"(?<![\d.])"
+        r"(?:\d{1,3}\.\d{1,3}(?:\.\d+)?)\s+"
     )
+    _LEGAL_CLAUSE_BOUNDARY_RE = re.compile(
+        r"(?=(?:"
+        # Title-case/caps keywords only — avoids matching the common word "clause" in body text.
+        r"(?:^|(?<=\s))(?-i:Article|SECTION|Section|Clause)\s+[\w.\-()]+"
+        r"|"
+        + _LEGAL_NUMBERED_CLAUSE_START
+        + r"))",
+        re.MULTILINE,
+    )
+    # Same rules as boundaries, for post-pass multi-clause detection inside a segment.
+    _LEGAL_CLAUSE_HEADER_INLINE_RE = re.compile(
+        r"(?:^|(?<=\s))(?-i:Article|SECTION|Section|Clause)\s+[\w.\-()]+"
+        r"|"
+        + _LEGAL_NUMBERED_CLAUSE_START,
+    )
+
+    def _legal_clause_split_indices(self, text: str) -> List[int]:
+        """Return sorted unique split indices including 0 and len(text) for clause boundaries."""
+        if not isinstance(text, str) or not text.strip():
+            return [0, 0]
+        t = text.replace("\r\n", "\n").strip()
+        starts = {0}
+        for m in self._LEGAL_CLAUSE_BOUNDARY_RE.finditer(t):
+            starts.add(m.start())
+        starts.add(len(t))
+        return sorted(starts)
+
+    def _legal_refine_no_multi_clause(self, segments: List[str]) -> List[str]:
+        """
+        If any segment still contains more than one clause header after the first match, split again.
+        Keeps one primary clause per chunk where possible.
+        """
+        out: List[str] = []
+        for seg in segments:
+            s = seg.strip()
+            if not s:
+                continue
+            headers = list(self._LEGAL_CLAUSE_HEADER_INLINE_RE.finditer(s))
+            if len(headers) <= 1:
+                out.append(s)
+                continue
+            # Split at each header after the first
+            cuts = [0] + [m.start() for m in headers[1:]] + [len(s)]
+            for i in range(len(cuts) - 1):
+                piece = s[cuts[i] : cuts[i + 1]].strip()
+                if piece:
+                    out.append(piece)
+        return out
 
     def _legal_clause_primary_split(self, text: str) -> List[str]:
         """
-        1단계: 조항·문단 경계 정규식으로 분할 (글자 수 슬라이딩 없음).
-        구분: \\n\\n, \\nArticle, \\nSection(/SECTION), \\n숫자.숫자 공백 (예: 10.8 ).
+        Split the document into individual clauses using clause-start regex only (no merging).
+        Newlines optional: boundaries use Article/Section/Clause and numbered x.y(.z)? patterns.
         """
         if not isinstance(text, str) or not text.strip():
             return []
         t = text.replace("\r\n", "\n").strip()
-        boundaries = [0]
-        for m in self._LEGAL_CLAUSE_BOUNDARY_RE.finditer(t):
-            if m.start() > 0:
-                boundaries.append(m.start())
-        boundaries.append(len(t))
-        boundaries = sorted(set(boundaries))
+        bounds = self._legal_clause_split_indices(t)
         segments: List[str] = []
-        for i in range(len(boundaries) - 1):
-            a, b = boundaries[i], boundaries[i + 1]
+        for i in range(len(bounds) - 1):
+            a, b = bounds[i], bounds[i + 1]
             seg = t[a:b].strip()
             if seg:
                 segments.append(seg)
-        return segments
+        return self._legal_refine_no_multi_clause(segments)
 
     def _extract_legal_heading(self, text: str) -> str:
         """
-        청크 앞부분(첫 1~2줄)에서 조항 헤딩을 추출한다.
-        매칭 예: "Article 3 ...", "Section 10.2 ...", "10.2 ..."
+        Extract clause number/title from the start of the chunk (first line or first ~200 chars).
+        Covers Article/Section/Clause labels and decimal section numbers.
         """
         if not isinstance(text, str):
             return ""
-        t = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        t = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        t = re.sub(r"\s+", " ", t).strip()
         if not t:
             return ""
-        lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
-        if not lines:
-            return ""
-        head_scope = "\n".join(lines[:2])
+        head_scope = t[: min(len(t), 400)]
         patterns = [
-            r"(?im)^(Article\s+[A-Za-z0-9.\-()]+(?:\s*[:.\-]\s*|\s+).*)$",
-            r"(?im)^(Section\s+[A-Za-z0-9.\-()]+(?:\s*[:.\-]\s*|\s+).*)$",
-            r"(?im)^(\d{1,3}(?:\.\d{1,3}){1,3}(?:\s*[:.\-]\s*|\s+).*)$",
+            r"(?is)^\s*((?:Article|Section|Clause)\s+[\w.\-IVXLC()]+(?:\s*[:.\-]\s*\S{0,100}|(?:\s+.{3,180})?))",
+            r"(?is)^\s*(\d{1,3}\.\d{1,3}(?:\.\d+)?(?:\s*[:.\-]\s*\S{0,100}|(?:\s+.{3,200})?))",
         ]
         for pat in patterns:
             m = re.search(pat, head_scope)
             if m:
-                return m.group(1).strip()
+                h = m.group(1).strip()
+                if len(h) > 220:
+                    h = h[:217].rstrip() + "..."
+                return h
         return ""
 
     def _legal_fallback_split_oversized(
@@ -427,8 +516,9 @@ class L2RAGOfflineIndexer:
         chunk_overlap: int,
     ) -> List[str]:
         """
-        legal/cuad: 조항 단위 1차 분할 → 초과 시에만 폴백 분할 + 소량 overlap.
-        짧은 조항에는 overlap 없음(0).
+        legal/cuad: regex clause split first (1 clause = 1 chunk; never merge short clauses).
+        Only if a single clause exceeds chunk_size, sub-split with RecursiveCharacterTextSplitter
+        when available, else character fallback with overlap.
         """
         clauses = self._legal_clause_primary_split(doc)
         if not clauses:
@@ -437,11 +527,29 @@ class L2RAGOfflineIndexer:
         fb_overlap = max(100, min(200, chunk_size // 10))
         if chunk_overlap > 0:
             fb_overlap = max(fb_overlap, min(200, chunk_overlap // 2))
+        sub_overlap = min(chunk_overlap, max(0, chunk_size // 8))
 
         out: List[str] = []
         for clause in clauses:
             if len(clause) <= chunk_size:
                 out.append(clause)
+            elif RecursiveCharacterTextSplitter is not None:
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=chunk_size,
+                    chunk_overlap=sub_overlap,
+                    separators=["\n\n", "\n", ". ", "; ", ", ", " ", ""],
+                )
+                sub = splitter.split_text(clause)
+                if sub:
+                    out.extend(sub)
+                else:
+                    out.extend(
+                        self._legal_fallback_split_oversized(
+                            clause,
+                            max_len=chunk_size,
+                            overlap=fb_overlap,
+                        )
+                    )
             else:
                 out.extend(
                     self._legal_fallback_split_oversized(
@@ -466,10 +574,10 @@ class L2RAGOfflineIndexer:
         """
         2. Chunking [cite: 36, 57]
         - general/medical 등: 고정 길이(chunk_size, chunk_overlap) + RecursiveCharacterTextSplitter 또는 슬라이딩 분할.
-        - legal / cuad: 조항(Clause) 단위 1차 정규식 분할 후, chunk_size 초과 조항만
-          마침표·줄바꿈 기준 2차 분할 + 소량 overlap(100~200자대).
+        - legal / cuad: 조항 시작 정규식으로 1 clause = 1 chunk (짧은 조항도 합치지 않음);
+          chunk_size 초과 조항만 RecursiveCharacterTextSplitter(또는 폴백)로 내부 분할.
         - doc_id_per_clean_doc[i]: clean_docs[i]의 문서 고유 ID(제목 등). 없으면 "doc_0", "doc_1" ...
-        - 반환: [{"text", "metadata": {"doc_id", "chunk_idx"}, "doc_index", "original_doc_id"}, ...]
+        - 반환: [{"text", "metadata": {"doc_id", "chunk_idx", "section_heading?"}, ...}, ...]
           청크 텍스트와 doc_id가 메타데이터로 1:1 매칭되며, 임베딩 배열 인덱스와 일치.
         """
         if len(original_doc_ids_per_doc) != len(clean_docs):
@@ -480,6 +588,10 @@ class L2RAGOfflineIndexer:
         doc_ids = doc_id_per_clean_doc if doc_id_per_clean_doc is not None else [f"doc_{i}" for i in range(len(clean_docs))]
         chunks: List[Dict[str, Any]] = []
         use_legal_clause_chunking = self.domain_mode in ("cuad", "legal")
+        # hotpot: paragraphs are already passage-sized → one chunk per paragraph so
+        # each chunk's parent doc_id maps 1:1 to the corpus paragraph index
+        # (Invariant 1 for supporting-passage recall). No legal clause splitting.
+        use_single_chunk_per_doc = self.domain_mode == "hotpot"
 
         def _sliding_char_split(text: str, cs: int, co: int) -> List[str]:
             """langchain 미설치 환경에서도 chunk_size/overlap을 만족하는 슬라이딩 분할."""
@@ -538,7 +650,9 @@ class L2RAGOfflineIndexer:
                 orig_ids = orig_ids[0]
             doc_id_str = doc_ids[doc_index]
 
-            if use_legal_clause_chunking:
+            if use_single_chunk_per_doc:
+                piece_texts = [doc] if doc and doc.strip() else []
+            elif use_legal_clause_chunking:
                 piece_texts = self._chunking_legal_clause_based(doc, chunk_size, chunk_overlap)
             elif splitter is not None:
                 piece_texts = splitter.split_text(doc)
@@ -558,9 +672,12 @@ class L2RAGOfflineIndexer:
                 if not piece:
                     continue
                 heading = self._extract_legal_heading(piece) if use_legal_clause_chunking else ""
+                meta_inner: Dict[str, Any] = {"doc_id": doc_id_str, "chunk_idx": chunk_idx}
+                if use_legal_clause_chunking:
+                    meta_inner["section_heading"] = heading
                 chunks.append({
                     "text": piece,
-                    "metadata": {"doc_id": doc_id_str, "chunk_idx": chunk_idx},
+                    "metadata": meta_inner,
                     "doc_index": doc_index,
                     "doc_id": doc_id_str,
                     "chunk_idx": chunk_idx,
@@ -1031,6 +1148,13 @@ class L2RAGOfflineIndexer:
             pickle.dump(hw_ready_state["l2_accelerator_2_pq_codes"], f)
         with open(os.path.join(output_dir, "metadata_db.pkl"), "wb") as f:
             pickle.dump(hw_ready_state["metadata_sram"], f)
+        if hw_ready_state.get("raw_embeddings") is not None:
+            np.save(os.path.join(output_dir, "raw_embeddings.npy"), hw_ready_state["raw_embeddings"])
+        if hw_ready_state.get("chunk_ids_order") is not None:
+            with open(os.path.join(output_dir, "chunk_ids_order.pkl"), "wb") as f:
+                pickle.dump(hw_ready_state["chunk_ids_order"], f)
+        if self._opq_rotation is not None:
+            np.save(os.path.join(output_dir, "opq_rotation.npy"), self._opq_rotation)
 
         config = {
             "embedding_dim": hw_ready_state.get("embedding_dim", self.embedding_dim),
@@ -1102,6 +1226,11 @@ class L2RAGOfflineIndexer:
         )
         # step3: general/legal/medical 모두 임베딩 추출 직후 L2 정규화(norm=1) 적용 → IVF/PQ 입력
         embs = self.step3_extract_embeddings(chunks, batch_size=batch_size)
+        raw_embeddings = embs.copy()
+        chunk_ids_order = [
+            f"{chunk.get('doc_index', chunk.get('doc_id'))}_{chunk['chunk_idx']}"
+            for chunk in chunks
+        ]
         embs = self.step4_optional_opq(embs)
 
         self.step5_train_ivf_centroids(embs)  # centroid 저장 직전에도 L2 정규화 적용됨
@@ -1116,6 +1245,8 @@ class L2RAGOfflineIndexer:
         self.step9_storage_optimization()
 
         hw_ready_state = self.step10_deploy_to_accelerator()
+        hw_ready_state["raw_embeddings"] = raw_embeddings
+        hw_ready_state["chunk_ids_order"] = chunk_ids_order
 
         self._compute_and_save_df_stats(clean_docs, save_dir)
         self._save_artifacts(hw_ready_state, save_dir)
@@ -1152,14 +1283,14 @@ class L2RAGOfflineIndexer:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="오프라인 인덱싱 (도메인별 HF 모델 + 벤치마크 데이터셋)")
-    parser.add_argument("--domain", type=str, default=None, choices=["general", "legal", "medical", "cuad"], help="단일 도메인만 실행 시 지정")
-    parser.add_argument("--from_dataset", action="store_true", help="벤치마크 데이터셋(squad/cuad/pubmed_qa)으로부터 로드")
+    parser.add_argument("--domain", type=str, default=None, choices=["general", "legal", "medical", "cuad", "hotpot"], help="단일 도메인만 실행 시 지정")
+    parser.add_argument("--from_dataset", action="store_true", help="벤치마크 데이터셋(squad/cuad/pubmed_qa/hotpot)으로부터 로드")
     parser.add_argument("--max_docs", type=int, default=500, help="데이터셋 사용 시 최대 문서 수")
     parser.add_argument("--output_dir", type=str, default=".")
     parser.add_argument(
         "--chunk_size",
         type=int,
-        default=1500,
+        default=300,
         help="청크 크기(문자 기준). cuad/legal 긴 조항을 잘리지 않게 크게 설정",
     )
     parser.add_argument(
@@ -1177,10 +1308,15 @@ if __name__ == "__main__":
         print(f"[{domain_mode.upper()}] 오프라인 인덱싱 (모델: {DOMAIN_MODEL_MAP[domain_mode]}, 데이터셋: {DOMAIN_DATASET_MAP.get(domain_mode, 'N/A')})")
         try:
             indexer = L2RAGOfflineIndexer(domain_mode=domain_mode, output_base_dir=BASE_OUTPUT_DIR)
-            if args.from_dataset:
+            # hotpot always indexes from its local processed_hotpot corpus (no
+            # --from_dataset needed). Do NOT cap the corpus: truncation would drop
+            # gold paragraphs and break supporting-passage recall (Invariant 1).
+            use_dataset = args.from_dataset or domain_mode == "hotpot"
+            max_docs = None if domain_mode == "hotpot" else args.max_docs
+            if use_dataset:
                 hw_state = indexer.run_pipeline_from_dataset(
                     split="train",
-                    max_docs=args.max_docs,
+                    max_docs=max_docs,
                     output_dir=None,
                     batch_size=16,
                     chunk_size=args.chunk_size,

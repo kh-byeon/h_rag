@@ -1,0 +1,18 @@
+{
+  "k": 0.00018968132522456421,
+  "n_queries": 128,
+  "n_candidates": 128,
+  "ratio_stats": {
+    "p5": 0.00017606976403050328,
+    "p50": 0.00018968132522456421,
+    "p95": 0.00020611863819074378
+  },
+  "seed": 0,
+  "device_fit_path": "igzo_fit.json",
+  "scaler_source": "PQ-recon",
+  "schema_version": 2,
+  "reduction_mode": "sum",
+  "fit_sha256": "51ba94495c0190c99a617e4f3186b106aeae7eba5be38fe6614c0f3e12c6283e",
+  "v_min": -3.0,
+  "v_max": 3.0
+}

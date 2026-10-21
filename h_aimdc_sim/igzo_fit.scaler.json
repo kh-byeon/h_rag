@@ -1,0 +1,13 @@
+{
+  "x_lo": -0.061731427907943726,
+  "x_hi": 0.06327169388532639,
+  "v_min": -1.0,
+  "v_max": 1.0,
+  "pct": [
+    1.0,
+    99.0
+  ],
+  "embedding_dim": 768,
+  "fit_sha256": "51ba94495c0190c99a617e4f3186b106aeae7eba5be38fe6614c0f3e12c6283e",
+  "reduction_mode": "sum"
+}

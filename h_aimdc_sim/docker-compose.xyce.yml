@@ -1,0 +1,16 @@
+services:
+  xyce:
+    build:
+      context: .
+      dockerfile: Dockerfile.xyce
+    image: xyce-openvaf:7.8.0
+    working_dir: /work
+    volumes:
+      - ./:/work
+    tty: true
+    stdin_open: true
+    command: >
+      bash -lc "
+      openvaf igzo_tft.va -o igzo_tft.so &&
+      Xyce -plugin ./igzo_tft.so sim_igzo.sp
+      "
