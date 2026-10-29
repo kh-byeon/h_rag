@@ -2465,6 +2465,26 @@ def _reconstruct_pq_all(
     return np.stack(out_rows, axis=0).astype(np.float32, copy=False)
 
 
+class SoftwareL2Distance:
+    """Digital stand-in for ``DeviceDistance``: exact Euclidean pair distances, no noise.
+
+    With it the re-ranker runs its identical procedure -- calibration pass, z-standardized
+    tau_dup gate and spread-matched diversity term -- in digital arithmetic. This is the
+    "digital identical MMR" arm of the ablation (``--mmr_mode software_std``). The plain
+    software path (``--mmr_mode software``) instead skips the per-query standardization.
+    """
+
+    def __init__(self) -> None:
+        from aimdc_device_distance import NoiseModel
+
+        self.noise = NoiseModel()
+
+    def pair_matrix(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        aa = np.asarray(a, dtype=np.float64)
+        bb = np.asarray(b, dtype=np.float64)
+        return np.linalg.norm(aa[:, np.newaxis, :] - bb[np.newaxis, :, :], axis=-1)
+
+
 def _configure_device_distance(
     hw_state: Dict[str, Any],
     *,
@@ -2691,6 +2711,7 @@ def run_mmr_evaluation(
     max_requery_rounds: int = 3,
     use_centroid_filter: bool = True,
     use_device_distance: bool = False,
+    mmr_software_standardized: bool = False,
     device_fit_path: str = "",
     device_scaler_path: Optional[str] = None,
     device_reduce: str = "sum",
@@ -2772,6 +2793,11 @@ def run_mmr_evaluation(
             device_v_min=device_v_min,
             device_v_max=device_v_max,
         )
+    if mmr_software_standardized:
+        if device_dd is not None:
+            raise ValueError("mmr_software_standardized and use_device_distance are exclusive")
+        device_dd = SoftwareL2Distance()  # type: ignore[assignment]
+        device_scale_k_val = None
     centroid_dd = None
     if use_centroid_device_distance:
         from aimdc_nvm_device_distance import (
@@ -2931,6 +2957,8 @@ def run_mmr_evaluation(
         standardize_mmr_terms=standardize_mmr_terms,
         retrieval_scope=effective_scope,
     )
+    if mmr_software_standardized:
+        pipeline._mmr_distance_backend = "software"
     doc_chunk_text_index = _build_doc_chunk_text_index(pipeline.metadata_sram or {})
     
     metrics_l2: List[Dict[str, Any]] = []  # L2 baseline

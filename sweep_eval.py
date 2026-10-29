@@ -151,8 +151,10 @@ def main() -> None:
         "--mmr_mode",
         type=str,
         default="software",
-        choices=["software", "capacitor"],
-        help="MMR pair-distance backend. 'software' (default) uses numpy L2; "
+        choices=["software", "software_std", "capacitor"],
+        help="MMR pair-distance backend. 'software' (default) uses numpy L2 without the "
+        "per-query standardization; 'software_std' uses numpy L2 with the identical "
+        "procedure of the device path (calibration pass, z-gate, spread matching); "
         "'capacitor' uses analytical capacitor DeviceDistance.",
     )
     parser.add_argument(
@@ -218,6 +220,14 @@ def main() -> None:
         type=float,
         default=3.0,
         help="Capacitor MMR-path operating voltage window upper bound (default 3.0).",
+    )
+    parser.add_argument(
+        "--query_emb_map",
+        type=str,
+        default=None,
+        help="Optional .npz with 'texts' (exact encoder inputs) and 'emb' (N, 768): replay "
+        "query embeddings from disk instead of running the sentence encoder "
+        "(scripts/dump_search_text_embeddings.py). A text not in the map raises.",
     )
     parser.add_argument(
         "--anchor_protect_n",
@@ -293,6 +303,21 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.query_emb_map:
+        import numpy as _np
+        import online_accelerator_device as _oad
+
+        _z = _np.load(args.query_emb_map, allow_pickle=True)
+        _table = {str(t): _np.asarray(e, dtype=_np.float32) for t, e in zip(_z["texts"], _z["emb"])}
+
+        def _encode_from_map(self, text):  # type: ignore[no-untyped-def]
+            if text not in _table:
+                raise KeyError(f"--query_emb_map has no embedding for search text {text[:100]!r}")
+            return _table[text].copy()
+
+        _oad.L2RAGOnlinePipeline._encode_query_general = _encode_from_map
+        print(f"[sweep] query embeddings replayed from {args.query_emb_map} ({len(_table)} texts)", flush=True)
+
     # Apply optional grid overrides (comma-separated CLI values).
     def _flist(s):
         return [float(x) for x in str(s).replace(" ", "").split(",") if x]
@@ -332,6 +357,15 @@ def main() -> None:
                 "device_scale_k": args.device_scale_k,
                 "device_v_min": float(args.device_v_min),
                 "device_v_max": float(args.device_v_max),
+                "standardize_mmr_terms": bool(args.standardize_mmr_terms),
+            }
+        )
+
+    # Digital MMR with the device path's per-query standardization (ablation arm)
+    if args.mmr_mode == "software_std":
+        hw_kwargs.update(
+            {
+                "mmr_software_standardized": True,
                 "standardize_mmr_terms": bool(args.standardize_mmr_terms),
             }
         )
