@@ -13,6 +13,8 @@ from typing import Any, Literal, Mapping, Optional, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from aimdc_variation import FrozenCellVariation
+
 from h_aimdc_sim.aimdc_sim_core import DEFAULT_CIRCUIT_PARAMS, load_fit_json
 
 K_B = 1.380649e-23
@@ -75,6 +77,11 @@ class NoiseModel:
     adc_bits: Optional[int] = None
     adc_i_fullscale: float = 1e-6
     rng_seed: Optional[int] = None
+    # Device-to-device variation: when True, sigma_alpha, sigma_log_mu and sigma_vth are
+    # drawn once per cell (see aimdc_variation.py) instead of on every read. Alpha and
+    # gain are common to the two branches of a cell; threshold offsets are per branch.
+    frozen_variation: bool = False
+    variation_seed: Optional[int] = None
 
     def enabled(self) -> bool:
         return any(
@@ -99,8 +106,10 @@ def noise_model_from_mapping(data: Mapping[str, Any]) -> NoiseModel:
     for k, v in data.items():
         if k not in valid:
             continue
-        if k == "shot_enable":
+        if k in ("shot_enable", "frozen_variation"):
             kwargs[k] = bool(v)
+        elif k == "variation_seed":
+            kwargs[k] = None if v is None else int(v)
         elif k == "adc_bits":
             kwargs[k] = None if v is None else int(v)
         elif k == "retention_tau":
@@ -244,6 +253,10 @@ class NvmDeviceDistance:
 
         self.noise: NoiseModel = noise if noise is not None else NoiseModel()
         self._rng = np.random.default_rng(self.noise.rng_seed)
+        self._frozen: Optional[FrozenCellVariation] = (
+            FrozenCellVariation(self.noise.variation_seed or 0)
+            if self.noise.frozen_variation else None
+        )
         self._inv_v_in: Optional[NDArray[np.float64]] = None
         self._inv_v_out: Optional[NDArray[np.float64]] = None
         if inverter_vtc_path:
@@ -397,13 +410,22 @@ class NvmDeviceDistance:
         if self._fefet_model is not None:
             # 2-FeFET cell: w = V_PRG, complement via V_FOLD.
             w = v_prg_b
-            if noise.enabled() and noise.sigma_vth > 0.0:
+            fz = self._frozen if noise.enabled() else None
+            if fz is not None and noise.sigma_vth > 0.0:
+                # stored-value (notch) offset of the cell, fixed for every read
+                w = w + fz.field("vth", noise.sigma_vth, shape)
+            elif noise.enabled() and noise.sigma_vth > 0.0:
                 w = w + rng.normal(0.0, noise.sigma_vth, size=shape)
             if noise.enabled() and noise.retention_tau is not None and noise.t_hold > 0.0:
                 w = w * np.exp(-noise.t_hold / float(noise.retention_tau))
             v_fold = float(self.v_fold)
             g1 = v_sl_b - w - v_ml
             g2 = (v_fold - v_sl_b) - (v_fold - w) - v_ml  # = w - v_sl - v_ml
+            if fz is not None and noise.sigma_alpha > 0.0:
+                # coupling (capacitor-divider) ratio of the cell scales its gate drive
+                a = 1.0 + fz.field("alpha", noise.sigma_alpha, shape)
+                g1 = a * (v_sl_b - w) - v_ml
+                g2 = a * (w - v_sl_b) - v_ml
             # Evaluate ref model; allow_extrapolation for batch distance (scaler may
             # push edges). Validity is enforced at deck/config time.
             flat1 = g1.reshape(-1)
@@ -411,6 +433,9 @@ class NvmDeviceDistance:
             i1 = self._fefet_model.current(flat1, dv=0.0, allow_extrapolation=True)
             i2 = self._fefet_model.current(flat2, dv=0.0, allow_extrapolation=True)
             i_out = (i1 + i2).reshape(shape)
+            if fz is not None and noise.sigma_log_mu > 0.0:
+                # cell gain (log10 units), common to both FeFETs of the pair
+                i_out = i_out * np.power(10.0, fz.field("gain", noise.sigma_log_mu, shape))
             if noise.enabled():
                 if noise.flicker_sigma > 0.0:
                     i_out = i_out * (1.0 + rng.normal(0.0, noise.flicker_sigma, size=shape))

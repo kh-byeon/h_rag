@@ -2577,7 +2577,8 @@ def _configure_device_distance(
     print(
         "[Device-L2] noise: "
         f"enabled={ne}, ktc_C={noise.ktc_C}, σα={noise.sigma_alpha}, "
-        f"σvth={noise.sigma_vth}, retention_tau={noise.retention_tau}, adc={noise.adc_bits}"
+        f"σvth={noise.sigma_vth}, σlogμ={noise.sigma_log_mu}, retention_tau={noise.retention_tau}, adc={noise.adc_bits}, "
+        f"frozen_variation={noise.frozen_variation}, variation_seed={noise.variation_seed}"
     )
     print(
         "[Device-L2] scope: AIMDC is strictly the MMR diversity accelerator "

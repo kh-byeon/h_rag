@@ -12,6 +12,8 @@ from typing import Any, Literal, Mapping, Optional, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from aimdc_variation import FrozenCellVariation
+
 from h_aimdc_sim.aimdc_sim_core import DEFAULT_CIRCUIT_PARAMS, load_fit_json
 
 K_B = 1.380649e-23
@@ -45,6 +47,11 @@ class NoiseModel:
     adc_bits: Optional[int] = None
     adc_i_fullscale: float = 1e-6
     rng_seed: Optional[int] = None
+    # Device-to-device variation: when True, sigma_alpha, sigma_log_mu and sigma_vth are
+    # drawn once per cell (see aimdc_variation.py) instead of on every read. Alpha and
+    # gain are common to the two branches of a cell; threshold offsets are per branch.
+    frozen_variation: bool = False
+    variation_seed: Optional[int] = None
 
     def enabled(self) -> bool:
         return any(
@@ -69,8 +76,10 @@ def noise_model_from_mapping(data: Mapping[str, Any]) -> NoiseModel:
     for k, v in data.items():
         if k not in valid:
             continue
-        if k == "shot_enable":
+        if k in ("shot_enable", "frozen_variation"):
             kwargs[k] = bool(v)
+        elif k == "variation_seed":
+            kwargs[k] = None if v is None else int(v)
         elif k == "adc_bits":
             kwargs[k] = None if v is None else int(v)
         elif k == "retention_tau":
@@ -142,6 +151,10 @@ class DeviceDistance:
         self.v_ml = float(v_ml)
         self.noise: NoiseModel = noise if noise is not None else NoiseModel()
         self._rng = np.random.default_rng(self.noise.rng_seed)
+        self._frozen: Optional[FrozenCellVariation] = (
+            FrozenCellVariation(self.noise.variation_seed or 0)
+            if self.noise.frozen_variation else None
+        )
         self._x_lo: Optional[float] = None
         self._x_hi: Optional[float] = None
         self._fit_pct: tuple[float, float] = (1.0, 99.0)
@@ -282,7 +295,10 @@ class DeviceDistance:
             v_prg_eff = v_prg_eff + rng.normal(0.0, sig, size=shape)
         if noise.retention_tau is not None and noise.t_hold > 0.0:
             v_prg_eff = v_prg_eff * np.exp(-noise.t_hold / float(noise.retention_tau))
-        if noise.sigma_alpha > 0.0:
+        if noise.sigma_alpha > 0.0 and self._frozen is not None:
+            alpha_l = 1.0 + self._frozen.field("alpha", noise.sigma_alpha, shape)
+            alpha_r = alpha_l
+        elif noise.sigma_alpha > 0.0:
             alpha_l = 1.0 + rng.normal(0.0, noise.sigma_alpha, size=shape)
             alpha_r = 1.0 + rng.normal(0.0, noise.sigma_alpha, size=shape)
         else:
@@ -303,12 +319,19 @@ class DeviceDistance:
         p2_a = np.full(shape, float(th[5]), dtype=np.float64)
         p3_a = np.full(shape, float(th[6]), dtype=np.float64)
 
-        if noise.sigma_vth > 0.0:
+        if noise.sigma_vth > 0.0 and self._frozen is not None:
+            vth_l = vth_l + self._frozen.field("vth_l", noise.sigma_vth, shape)
+            vth_r = vth_r + self._frozen.field("vth_r", noise.sigma_vth, shape)
+        elif noise.sigma_vth > 0.0:
             vth_l = vth_l + rng.normal(0.0, noise.sigma_vth, size=shape)
             vth_r = vth_r + rng.normal(0.0, noise.sigma_vth, size=shape)
         if noise.sigma_log_mu > 0.0:
-            s_l = rng.normal(0.0, noise.sigma_log_mu, size=shape)
-            s_r = rng.normal(0.0, noise.sigma_log_mu, size=shape)
+            if self._frozen is not None:
+                s_l = self._frozen.field("gain", noise.sigma_log_mu, shape)
+                s_r = s_l
+            else:
+                s_l = rng.normal(0.0, noise.sigma_log_mu, size=shape)
+                s_r = rng.normal(0.0, noise.sigma_log_mu, size=shape)
             c0_l = c0_l + s_l
             p0_l = p0_l + s_l
             c0_r = c0_r + s_r
