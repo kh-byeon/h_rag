@@ -1,8 +1,8 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite the paper and this repository."
-title: "h_rag: H-AIMDC simulation pipeline for diversity-aware edge RAG"
-version: 1.0.0
-date-released: 2026-10-21
+title: "h_rag: U-AIMDC simulation pipeline for diversity-aware retrieval (formerly H-AIMDC)"
+version: 1.1.0
+date-released: 2026-10-30
 license: MIT
 repository-code: "https://github.com/kh-byeon/h_rag"
 authors:
@@ -26,7 +26,7 @@ authors:
     affiliation: "Seoul National University"
 preferred-citation:
   type: article
-  title: "Diversity-aware retrieval-augmented generation acceleration at the edge enabled by FeFET-IGZO heterogeneous analog in-memory distance computing"
+  title: "Monolithic integration of ferroelectric and dielectric capacitors on a unified oxide-TFT platform for in-memory distance computing"
   authors:
     - family-names: Byun
       given-names: K. Aiden

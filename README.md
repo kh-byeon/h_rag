@@ -1,19 +1,31 @@
-# h_rag — H-AIMDC simulation pipeline
+# h_rag — U-AIMDC simulation pipeline
 
-Code for **"Diversity-aware retrieval-augmented generation acceleration at the edge
-enabled by FeFET-IGZO heterogeneous analog in-memory distance computing"**
+Code for **"Monolithic integration of ferroelectric and dielectric capacitors on a unified oxide-TFT platform for in-memory distance computing"**
 (K. A. Byun, H. S. Choi, C. Joe, D. H. Han, M. H. Park and S. Kim, Seoul National University).
 
-This repository contains the system-level simulation of heterogeneous analog in-memory
-distance computing (H-AIMDC) for retrieval-augmented generation (RAG): IVF/PQ index
-construction, the measurement-calibrated FeFET (static tier, centroid search) and
-IGZO-capacitor (dynamic tier, on-the-fly maximal-marginal-relevance re-ranking) cell
-models, quantized-LLM answer generation, scoring, and the statistical analysis reported
-in the paper. Device measurement data, the per-question results and the figure-plotting
-scripts live in the companion data repository
-**[h_aimdc_data](https://github.com/kh-byeon/h_aimdc_data)**.
+This repository contains the system-level simulation of unified analog in-memory distance
+computing (U-AIMDC) for retrieval-augmented generation (RAG): IVF/PQ index construction, the
+measurement-calibrated cell models of the static tier (FeCAP-coupled FeFET pair, centroid search)
+and of the dynamic tier (DeCAP-coupled IGZO 4T2C cell, on-the-fly maximal-marginal-relevance
+re-ranking), quantized-LLM answer generation, scoring, the statistical analysis and the simulation
+ablation reported in the paper. Device measurement data, the per-question results and the
+figure-plotting scripts live in the companion data repository
+**[h_aimdc_data](https://github.com/kh-byeon/h_aimdc_data)** (tag `v1.1.0`).
 
-Version used in the paper: **v1.0.0** (git tag `v1.0.0`).
+Version used in the paper: **v1.1.0** (git tag `v1.1.0`). v1.0.0 is the version cited in the
+original submission; the changes are listed in `CHANGELOG.md`.
+
+### Naming
+
+The repository, package and file names keep the project's original name, H-AIMDC
+(heterogeneous AIMDC), so that paths and run identifiers stay stable. In the paper the platform
+is called U-AIMDC, and the two storage roles are named after their capacitors:
+
+| Paper | Code |
+|---|---|
+| U-AIMDC | H-AIMDC, `h_aimdc_sim`, `aimdc_*` |
+| FeCAP cell (static tier, centroids) | FeFET, `nvm`, `aimdc_nvm_device_distance`, `--centroid_mode nvm` |
+| DeCAP cell (dynamic tier, selected set) | IGZO capacitor, `capacitor`, `aimdc_device_distance`, `--mmr_mode capacitor` |
 
 ## Repository layout
 
@@ -25,14 +37,15 @@ Version used in the paper: **v1.0.0** (git tag `v1.0.0`).
 | `online_accelerator_device.py` | Online retrieval: centroid search on the static tier, candidate streaming, on-the-fly MMR with the selected set resident in the dynamic tier, write/readout statistics and memory-traffic accounting |
 | `aimdc_nvm_device_distance/` | Analytical FeFET (2-FeFET complementary cell) match-line distance model for the static tier |
 | `aimdc_device_distance/` | Analytical IGZO-capacitor (4T2C) match-line distance model for the dynamic tier, with optional noise mechanisms (`noise_configs/`) |
+| `aimdc_variation.py` | Frozen device-to-device variation (per-cell coupling ratio, gain and threshold offset drawn once and reused on every read), used by both device models when `frozen_variation` is set in a noise config |
 | `h_aimdc_sim/` | Cell-level models and calibration against the measured devices: `fefet_ref_model.py`, `fefet_vth_calibration.py`, `igzo_powerlaw_model.py`, the fitted parameter files (`fefet_ref_fit_smu.json`, `igzo_fit.json`, `igzo_fit.k.json`, `nvm_operating_point.json`), and the Xyce/Verilog-A decks used to validate the analytical cell model (`igzo_tft.va`, `sim_*.sp`, `Dockerfile`) |
 | `sweep_eval.py` | Retrieval sweep driver (λ, τ_dup, γ, top-k grid) producing `sweep_exports/<run_id>/retrieval_<run_id>.jsonl` |
 | `llm_generator.py`, `scripts/run_generation_sweep.py` | Answer generation with Meta-Llama-3-8B-Instruct at fp16 / int8 / int4 (bitsandbytes), greedy decoding, resumable |
 | `postprocess.py`, `run_eval_from_generation.py`, `evaluation/` | Local, air-gapped post-processing of chunk references and the evaluation framework (answer EM/F1, supporting-passage recall, coverage, faithfulness/relevance via NLI) |
-| `scripts/` | Reproduction scripts (see below): `run_q1000_distractor.sh`, `analyze_q1000.py`, `run_write_stats*.sh`, `analyze_write_stats.py`, `make_fig2_counts.py`, `make_fig2_precision.py`, `make_paper_tables.py`, `analyze_did_q3500.py`, `calibrate_scale_k.py`, `validate_analytical_vs_xyce.py` |
+| `scripts/` | Reproduction scripts (see below): `run_q1000_distractor.sh`, `analyze_q1000.py`, `run_write_stats*.sh`, `analyze_write_stats.py`, `make_fig2_counts.py`, `make_fig2_precision.py`, `make_paper_tables.py`, `analyze_did_q3500.py`, `calibrate_scale_k.py`, `validate_analytical_vs_xyce.py`; simulation ablation: `run_ablation_q1000.sh`, `analyze_ablation.py`, `make_ablation_noise_configs.py`, `dump_search_text_embeddings.py` |
 | `sweep_exports/tol_run/` | Stored-value precision sweep proxy (`tol_probe.py`: IVF probe + top-50 MMR under injected Gaussian write noise) used by `make_fig2_precision.py` |
 | `tests/` | Unit tests for the device-distance models, MMR scoring units, write statistics and noise configs (`pytest tests`) |
-| `cuad/` | The variant of the pipeline files used for the CUAD intra-document experiment (Fig. 5a, Supplementary Note 1); see `cuad/README.md` |
+| `cuad/` | The variant of the pipeline files used for the CUAD intra-document experiment (Fig. 5a, Supplementary Note 5); see `cuad/README.md` |
 
 ## Requirements
 
@@ -111,13 +124,23 @@ python scripts/make_fig2_precision.py --out figures/fig2
 python scripts/make_paper_tables.py
 python scripts/analyze_did_q3500.py
 
-# 6. Unit tests (~1 min, CPU)
+# 6. Simulation ablation on the same 1,000 questions (Supplementary Note 6.4, Supplementary Table 14):
+#    digital L2, digital MMR with the identical procedure (--mmr_mode software_std), the calibrated
+#    average device, and frozen DeCAP device-to-device variation at 0.5x/1x/2x and per mechanism,
+#    five simulated dies each. Retrieval only, ~1 min per run on CPU; runs inside ws_q1000/.
+bash scripts/run_ablation_q1000.sh
+python scripts/analyze_ablation.py ablation/manifest.tsv --out ablation/ablation_q1000 \
+       --reference sweep_exports/<run_id of step 1> --export_perq ablation/ablation_q1000_perquestion.csv.gz
+#    Without the sentence encoder, replay the query embeddings written by
+#    scripts/dump_search_text_embeddings.py:  QEMB=sweep_exports/query_emb_q1000_searchtext.npz bash ...
+
+# 7. Unit tests (~1 min, CPU)
 pytest tests
 ```
 
 The plots themselves are produced by the scripts in the data repository
-(`plot_fig2_tiers.py`, `plot_fig2_precision.py`, `plot_q1000_figures.py`, `plot_fig5d_traffic.py`),
-which read the CSV/JSON outputs of steps 2-4.
+(`plot_fig2_tiers.py`, `plot_fig2_precision.py`, `plot_q1000_figures.py`, `plot_fig5d_operands.py`,
+`plot_fig5e_memory.py`), which read the CSV/JSON outputs of steps 2-4.
 
 ### Demo / smoke test
 
@@ -127,18 +150,23 @@ python scripts/make_fig2_precision.py --smoke        # 2 sigmas, 1 seed
 pytest tests
 ```
 
-### CUAD intra-document experiment (Fig. 5a, Supplementary Note 1)
+### CUAD intra-document experiment (Fig. 5a, Supplementary Note 5)
 
 The CUAD run used the pipeline variant in `cuad/` (clause-level chunking, intra-document
 retrieval, the four-step legal prompt, local chunk-reference resolution and aspect
 coverage scoring). Copy the files in `cuad/` over the top-level ones of the same name, then
 
 ```bash
-python sweep_eval.py --domain cuad --num_queries 50 --lambdas 0.7 --gammas 0.7 --tau_dups=-1.0 --top_ks 5
+python sweep_eval.py --domain cuad --num_queries 50 --lambdas 0.5 --gammas 0.2 --tau_dups=-1.0 --top_ks 10 \
+       --mmr_mode capacitor --centroid_mode nvm
 python scripts/run_generation_sweep.py --retrieval_jsonl sweep_exports/<run_id>/retrieval_<run_id>.jsonl \
        --llm_output_root llm_out_<quant> --quantization <fp16|int8|int4>
 python run_eval_from_generation.py --normalized_json generation_normalized_<quant>.json --output_dir evaluation_outputs
 ```
+
+These are the parameters of the reported CUAD run (k = 10, λ = 0.5, γ = 0.2, τ_dup = −1.0; run id
+`20260811_181301_mmr-capacitor_centroid-nvm`; v1.0.0 of this README listed the HotpotQA values by mistake).
+The centroid fit flags of that run were not recorded in its manifest.
 
 ## Citation
 

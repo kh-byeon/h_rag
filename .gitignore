@@ -16,6 +16,7 @@
 # configs, docs, packaging
 !.gitignore
 !README.md
+!CHANGELOG.md
 !LICENSE
 !CITATION.cff
 !requirements.txt
